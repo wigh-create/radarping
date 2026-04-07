@@ -89,13 +89,13 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
         block_id: 'audience_block',
         optional: true,
         element: {
-          type: 'static_select',
+          type: 'multi_static_select',
           action_id: 'audience_select',
-          placeholder: { type: 'plain_text', text: 'Choose a group or channel (optional)...' },
+          placeholder: { type: 'plain_text', text: 'Choose groups or channels (optional)...' },
           options: allOptions,
         },
-        label: { type: 'plain_text', text: '👥 Send to group', emoji: true },
-        hint: { type: 'plain_text', text: 'Optional — skip if you\'re only sending to individuals below' },
+        label: { type: 'plain_text', text: '👥 Send to groups / channels', emoji: true },
+        hint: { type: 'plain_text', text: 'Optional — select one or more groups/channels, or skip to send to individuals only' },
       });
     }
 
@@ -206,11 +206,11 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   if (linkUrl && !linkUrl.match(/^https?:\/\//i)) {
     linkUrl = `https://${linkUrl}`;
   }
-  const audienceValue = values.audience_block?.audience_select?.selected_option?.value;
+  const audienceValues = values.audience_block?.audience_select?.selected_options?.map(o => o.value) || [];
   const alsoPostChannel = values.also_post_block?.also_post_channel?.selected_conversation;
   const individualUsers = values.individual_block?.individual_users?.selected_users || [];
 
-  const hasAudience = (audienceValue && audienceValue !== 'none') || individualUsers.length > 0 || alsoPostChannel;
+  const hasAudience = audienceValues.length > 0 || individualUsers.length > 0 || alsoPostChannel;
   if (!hasAudience) {
     await client.chat.postMessage({
       channel: senderId,
@@ -219,52 +219,76 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
     return;
   }
 
-  // Resolve audience to a list of user IDs
+  // Resolve each selected audience to a list of user IDs
   let userIds = [];
-  let groupName = 'Unknown Group';
+  const groupNameParts = [];
   let targetType = 'manual';
   let targetId = null;
+  // Track whether the selection is channel-only (no groups, no individuals)
+  let selectedChannelNames = [];
+  let hasNonChannelAudience = false;
 
-  try {
-    if (audienceValue && audienceValue.startsWith('slack_ug:')) {
-      // Slack User Group
-      const [, ugId, ugName] = audienceValue.split(':');
-      groupName = ugName;
-      targetType = 'usergroup';
-      targetId = ugId;
+  for (const audienceValue of audienceValues) {
+    try {
+      if (audienceValue.startsWith('slack_ug:')) {
+        // Slack User Group
+        const [, ugId, ugName] = audienceValue.split(':');
+        groupNameParts.push(ugName);
+        targetType = 'usergroup';
+        targetId = ugId;
+        hasNonChannelAudience = true;
 
-      const membersRes = await client.usergroups.users.list({ usergroup: ugId });
-      userIds = membersRes.users || [];
+        const membersRes = await client.usergroups.users.list({ usergroup: ugId });
+        userIds = userIds.concat(membersRes.users || []);
 
-    } else if (audienceValue && audienceValue.startsWith('custom:')) {
-      // Custom in-app group
-      const [, groupId, gName] = audienceValue.split(':');
-      groupName = gName;
-      targetType = 'custom';
-      targetId = groupId;
+      } else if (audienceValue.startsWith('custom:')) {
+        // Custom in-app group
+        const [, groupId, gName] = audienceValue.split(':');
+        groupNameParts.push(gName);
+        targetType = 'custom';
+        targetId = groupId;
+        hasNonChannelAudience = true;
 
-      const group = await db.getGroup(groupId);
-      userIds = group ? group.member_ids : [];
+        const group = await db.getGroup(groupId);
+        userIds = userIds.concat(group ? group.member_ids : []);
 
-    } else if (audienceValue && audienceValue.startsWith('channel:')) {
-      // Channel - get members
-      const [, channelId, chanName] = audienceValue.split(':');
-      groupName = `#${chanName}`;
-      targetType = 'channel';
-      targetId = channelId;
+      } else if (audienceValue.startsWith('channel:')) {
+        // Channel — get members and require read receipts from all of them
+        const [, channelId, chanName] = audienceValue.split(':');
+        groupNameParts.push(`#${chanName}`);
+        selectedChannelNames.push(chanName);
+        targetType = 'channel';
+        targetId = channelId;
 
-      const membersRes = await client.conversations.members({ channel: channelId });
-      userIds = (membersRes.members || []).filter(id => id !== senderId);
+        const membersRes = await client.conversations.members({ channel: channelId });
+        userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
+      }
+    } catch (err) {
+      logger.error('Error resolving audience:', err);
     }
-  } catch (err) {
-    logger.error('Error resolving audience:', err);
   }
 
   // Merge in any individually selected users (deduplicated)
-  const allUserIds = [...new Set([...userIds, ...individualUsers])];
-  if (individualUsers.length > 0 && (!audienceValue || audienceValue === 'none')) {
-    groupName = `${individualUsers.length} individual${individualUsers.length > 1 ? 's' : ''}`;
+  if (individualUsers.length > 0) {
+    hasNonChannelAudience = true;
   }
+  const allUserIds = [...new Set([...userIds, ...individualUsers])];
+
+  // Build a composite group name
+  let groupName;
+  if (groupNameParts.length > 0) {
+    groupName = groupNameParts.join(' + ');
+    if (individualUsers.length > 0) {
+      groupName += ` + ${individualUsers.length} individual${individualUsers.length > 1 ? 's' : ''}`;
+    }
+  } else if (individualUsers.length > 0) {
+    groupName = `${individualUsers.length} individual${individualUsers.length > 1 ? 's' : ''}`;
+  } else {
+    groupName = 'Unknown Group';
+  }
+
+  // Determine if this is a channel-only announcement (no groups, no individuals)
+  const isChannelOnly = selectedChannelNames.length > 0 && !hasNonChannelAudience;
 
   if (allUserIds.length === 0 && !alsoPostChannel) {
     await client.chat.postMessage({
@@ -273,12 +297,8 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
     });
     return;
   }
-  if (allUserIds.length === 0 && alsoPostChannel) {
-    groupName = 'Channel post only';
-  }
   userIds = allUserIds;
 
-  // Create announcement record
   const announcementId = randomUUID();
   await db.createAnnouncement({
     id: announcementId,
@@ -353,35 +373,49 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   }
 
   // Confirm to sender
+  const confirmBlocks = [
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: `✅ *Announcement sent!*\n📣 *"${message.slice(0, 100)}${message.length > 100 ? '...' : ''}"*\n\n👥 Sent to *${groupName}* — *${sent}/${recipientUsers.length}* DMs delivered.` },
+    },
+  ];
+
+  if (isChannelOnly) {
+    const channelList = selectedChannelNames.map(n => `#${n}`).join(', ');
+    confirmBlocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `⚠️ *All members of ${channelList} will need to confirm they've read this announcement.* Read receipts are being tracked for every channel member.` },
+    });
+  }
+
+  confirmBlocks.push(
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: `Track read receipts with:\n\`/announce-status ${announcementId.slice(0, 8)}\`` },
+    },
+    {
+      type: 'actions',
+      elements: [{
+        type: 'button',
+        text: { type: 'plain_text', text: '📊 Check Read Receipts', emoji: true },
+        action_id: 'check_status',
+        value: announcementId,
+        style: 'primary',
+      }],
+    }
+  );
+
   await client.chat.postMessage({
     channel: senderId,
     text: `✅ Announcement sent to *${groupName}*`,
-    blocks: [
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `✅ *Announcement sent!*\n📣 *"${message.slice(0, 100)}${message.length > 100 ? '...' : ''}"*\n\n👥 Sent to *${groupName}* — *${sent}/${recipientUsers.length}* DMs delivered.` },
-      },
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: `Track read receipts with:\n\`/announce-status ${announcementId.slice(0, 8)}\`` },
-      },
-      {
-        type: 'actions',
-        elements: [{
-          type: 'button',
-          text: { type: 'plain_text', text: '📊 Check Read Receipts', emoji: true },
-          action_id: 'check_status',
-          value: announcementId,
-          style: 'primary',
-        }],
-      },
-    ],
+    blocks: confirmBlocks,
   });
 });
 
 // ============================================================
 //  Read receipt button click
 // ============================================================
+
 app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
   await ack();
 
