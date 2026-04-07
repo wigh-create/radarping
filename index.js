@@ -182,6 +182,15 @@ app.command('/announce', async ({ ack, body, client, logger }) => {
 });
 
 // ============================================================
+//  /radarping - Alias for /announce
+// ============================================================
+app.command('/radarping', async ({ ack, body, client, logger }) => {
+  await ack();
+  const prefillMessage = (body.text || '').trim();
+  await openAnnounceModal({ client, triggerId: body.trigger_id, prefillMessage, logger });
+});
+
+// ============================================================
 //  Modal submit - send the announcement
 // ============================================================
 app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) => {
