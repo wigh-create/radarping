@@ -1265,7 +1265,9 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     ],
   });
 });
-app.action('pulse_scale_button', async ({ ack, body, action, client, logger }) => {
+// FIX: use regex to match pulse_scale_1 through pulse_scale_10
+// Each button needs a unique action_id — Slack rejects blocks with duplicate action_ids
+app.action(/^pulse_scale_\d+$/, async ({ ack, body, action, client, logger }) => {
   await ack();
   const userId = body.user.id;
   // action.value format: "campaignId:questionIndex:score"
@@ -1478,12 +1480,14 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
       });
     }
     // Two rows of buttons: 1-5 and 6-10
+    // Each button gets a unique action_id (pulse_scale_1 … pulse_scale_10)
+    // Slack rejects messages with duplicate action_ids
     blocks.push({
       type: 'actions',
       elements: [1, 2, 3, 4, 5].map(n => ({
         type: 'button',
         text: { type: 'plain_text', text: String(n), emoji: true },
-        action_id: 'pulse_scale_button',
+        action_id: `pulse_scale_${n}`,
         value: `${campaign.id}:${questionIndex}:${n}`,
       })),
     });
@@ -1492,7 +1496,7 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
       elements: [6, 7, 8, 9, 10].map(n => ({
         type: 'button',
         text: { type: 'plain_text', text: String(n), emoji: true },
-        action_id: 'pulse_scale_button',
+        action_id: `pulse_scale_${n}`,
         value: `${campaign.id}:${questionIndex}:${n}`,
       })),
     });
@@ -1511,7 +1515,7 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
       elements: [1, 2, 3, 4, 5].map(n => ({
         type: 'button',
         text: { type: 'plain_text', text: String(n), emoji: true },
-        action_id: 'pulse_scale_button',
+        action_id: `pulse_scale_${n}`,
         value: `${campaign.id}:${questionIndex}:${n}`,
       })),
     });
