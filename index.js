@@ -3,18 +3,15 @@
  *
  * Commands:
  *   /announce        - Compose and send an announcement to groups
+ *   /radarping       - Alias for /announce
  *   /announce-status - Check read receipts for your announcements
+ *   /radarpulse      - Send a pulse quiz / check-in
  */
 require('dotenv').config();
 const { App } = require('@slack/bolt');
 const { randomUUID } = require('crypto');
 const db = require('./db');
 const notion = require('./notion');
-
-// FIX: In-memory cache for pulse modal options.
-// Slack hard-limits private_metadata to 3000 chars — storing allOptions (up to 99 entries)
-// blows past that. We cache options server-side and store only a short session ID instead.
-const pulseModalCache = new Map();
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -23,36 +20,84 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
   port: process.env.PORT || 3456,
 });
+
+// ============================================================
+//  Shared: search audience options (usergroups + channels)
+//  Used by multi_external_select options handlers.
+//  No 100-option pre-load cap — searches on demand so every
+//  Slack user group and every invited channel is discoverable.
+// ============================================================
+async function searchAudienceOptions(client, query, logger) {
+  const q = (query || '').toLowerCase().trim();
+  const results = [];
+
+  // 1. Fetch ALL Slack user groups (no pagination on this endpoint)
+  try {
+    const ugRes = await client.usergroups.list({ include_disabled: false });
+    for (const ug of (ugRes.usergroups || [])) {
+      const label = `${ug.name} (${ug.handle})`;
+      if (!q || label.toLowerCase().includes(q) || ug.handle.toLowerCase().includes(q)) {
+        results.push({
+          text: { type: 'plain_text', text: label, emoji: true },
+          value: `slack_ug:${ug.id}:${ug.name}`,
+        });
+      }
+    }
+  } catch (e) {
+    logger.warn('searchAudienceOptions: Could not fetch usergroups:', e.message);
+  }
+
+  // 2. Fetch ALL channels the bot is invited to (paginated)
+  try {
+    let cursor;
+    let pages = 0;
+    do {
+      const chanRes = await client.conversations.list({
+        types: 'public_channel,private_channel',
+        limit: 200,
+        exclude_archived: true,
+        ...(cursor ? { cursor } : {}),
+      });
+      const botChannels = (chanRes.channels || []).filter(c => c.is_member);
+      for (const c of botChannels) {
+        const label = `#${c.name}`;
+        if (!q || c.name.toLowerCase().includes(q)) {
+          results.push({
+            text: { type: 'plain_text', text: label, emoji: true },
+            value: `channel:${c.id}:${c.name}`,
+          });
+        }
+      }
+      cursor = chanRes.response_metadata?.next_cursor;
+      pages++;
+    } while (cursor && pages < 10); // safety cap at 10 pages (~2000 channels)
+  } catch (e) {
+    logger.warn('searchAudienceOptions: Could not fetch channels:', e.message);
+  }
+
+  // Slack external_select allows up to 100 results per response
+  return results.slice(0, 100);
+}
+
+// ============================================================
+//  app.options handlers — Slack calls these when a user types
+//  in a multi_external_select dropdown. Returns matching options.
+// ============================================================
+app.options('audience_select', async ({ ack, options, client, logger }) => {
+  const results = await searchAudienceOptions(client, options.value, logger);
+  await ack({ options: results });
+});
+
+app.options('pulse_audience_select', async ({ ack, options, client, logger }) => {
+  const results = await searchAudienceOptions(client, options.value, logger);
+  await ack({ options: results });
+});
+
 // ============================================================
 //  Shared helper: open the announce modal (used by /announce and message shortcut)
 // ============================================================
 async function openAnnounceModal({ client, triggerId, prefillMessage = '', logger }) {
   try {
-    let ugOptions = [];
-    try {
-      const ugRes = await client.usergroups.list({ include_disabled: false });
-      ugOptions = (ugRes.usergroups || []).map(ug => ({
-        text: { type: 'plain_text', text: `${ug.name} (${ug.handle})`, emoji: true },
-        value: `slack_ug:${ug.id}:${ug.name}`,
-      }));
-    } catch (e) {
-      logger.warn('Could not fetch Slack usergroups:', e.message);
-    }
-    let channelOptions = [];
-    try {
-      const chanRes = await client.conversations.list({ types: 'public_channel,private_channel', limit: 200, exclude_archived: true });
-      const botChannels = (chanRes.channels || []).filter(c => c.is_member);
-      channelOptions = botChannels.slice(0, 50).map(c => ({
-        text: { type: 'plain_text', text: `#${c.name}`, emoji: true },
-        value: `channel:${c.id}:${c.name}`,
-      }));
-    } catch (e) {
-      logger.warn('Could not fetch channels:', e.message);
-    }
-    // Slack multi_static_select hard limit is 100 options total.
-    // Priority: ALL Slack usergroups first (no cap), then channels fill remaining slots.
-    const remainingSlots = Math.max(0, 100 - ugOptions.length);
-    const allOptions = [...ugOptions, ...channelOptions.slice(0, remainingSlots)].slice(0, 100);
     const blocks = [
       {
         type: 'input',
@@ -78,23 +123,19 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
         },
         label: { type: 'plain_text', text: 'Message', emoji: true },
       },
-    ];
-    if (allOptions.length > 0) {
-      blocks.push({
+      {
         type: 'input',
         block_id: 'audience_block',
         optional: true,
         element: {
-          type: 'multi_static_select',
+          type: 'multi_external_select',
           action_id: 'audience_select',
-          placeholder: { type: 'plain_text', text: 'Choose groups or channels (optional)...' },
-          options: allOptions,
+          placeholder: { type: 'plain_text', text: 'Search groups or channels...' },
+          min_query_length: 0,
         },
         label: { type: 'plain_text', text: '👥 Send to groups / channels', emoji: true },
-        hint: { type: 'plain_text', text: 'Optional — select one or more groups/channels, or skip to send to individuals only' },
-      });
-    }
-    blocks.push(
+        hint: { type: 'plain_text', text: 'Type to search Slack user groups and channels the bot is invited to' },
+      },
       {
         type: 'input',
         block_id: 'link_block',
@@ -131,8 +172,8 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
         },
         label: { type: 'plain_text', text: '📢 Also post in channel', emoji: true },
         hint: { type: 'plain_text', text: 'Optional: post publicly in a channel the bot has been invited to' },
-      }
-    );
+      },
+    ];
     await client.views.open({
       trigger_id: triggerId,
       view: {
@@ -153,7 +194,6 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
 // ============================================================
 app.shortcut('announce_from_message', async ({ ack, body, client, logger }) => {
   await ack();
-  // Extract plain text from the message (strip any Slack mrkdwn if needed)
   const messageText = body.message?.text || '';
   await openAnnounceModal({
     client,
@@ -208,13 +248,11 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   const groupNameParts = [];
   let targetType = 'manual';
   let targetId = null;
-  // Track whether the selection is channel-only (no groups, no individuals)
   let selectedChannelNames = [];
   let hasNonChannelAudience = false;
   for (const audienceValue of audienceValues) {
     try {
       if (audienceValue.startsWith('slack_ug:')) {
-        // Slack User Group
         const [, ugId, ugName] = audienceValue.split(':');
         groupNameParts.push(ugName);
         targetType = 'usergroup';
@@ -223,7 +261,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
         const membersRes = await client.usergroups.users.list({ usergroup: ugId });
         userIds = userIds.concat(membersRes.users || []);
       } else if (audienceValue.startsWith('channel:')) {
-        // Channel — get members and require read receipts from all of them
         const [, channelId, chanName] = audienceValue.split(':');
         groupNameParts.push(`#${chanName}`);
         selectedChannelNames.push(chanName);
@@ -236,12 +273,10 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       logger.error('Error resolving audience:', err);
     }
   }
-  // Merge in any individually selected users (deduplicated)
   if (individualUsers.length > 0) {
     hasNonChannelAudience = true;
   }
   const allUserIds = [...new Set([...userIds, ...individualUsers])];
-  // Build a composite group name
   let groupName;
   if (groupNameParts.length > 0) {
     groupName = groupNameParts.join(' + ');
@@ -253,7 +288,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   } else {
     groupName = 'Unknown Group';
   }
-  // Determine if this is a channel-only announcement (no groups, no individuals)
   const isChannelOnly = selectedChannelNames.length > 0 && !hasNonChannelAudience;
   if (allUserIds.length === 0 && !alsoPostChannel) {
     await client.chat.postMessage({
@@ -273,13 +307,11 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
     target_type: targetType,
     target_id: targetId,
   });
-  // Fetch user names
   const recipientUsers = [];
   for (const uid of userIds) {
     try {
       const info = await client.users.info({ user: uid });
       const u = info.user;
-      // Skip bots, deactivated users, the sender themselves
       if (u.is_bot || u.deleted || u.id === senderId) continue;
       recipientUsers.push({ user_id: u.id, user_name: u.profile?.real_name || u.profile?.display_name || u.name });
     } catch {
@@ -288,7 +320,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   }
   await db.addRecipients(announcementId, recipientUsers);
   await db.updateRecipientCount(announcementId, recipientUsers.length);
-  // Sync to Notion — create announcement row, then one row per recipient
   const sentAt = new Date().toISOString();
   notion.createAnnouncementPage({
     announcementId, title, message, senderName, groupName,
@@ -298,7 +329,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       notion.createRecipientRows({ announcementPageId, recipients: recipientUsers, sentAt });
     }
   });
-  // Send DM to each recipient with read button
   let sent = 0;
   for (const recipient of recipientUsers) {
     try {
@@ -307,7 +337,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
         text: `📣 Announcement from <@${senderId}>: ${message}`,
         blocks: buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl),
       });
-      // Store ts so we can update the DM when they read from any location
       if (dmResult?.ts) {
         await db.storeDmTs(announcementId, recipient.user_id, dmResult.ts, dmResult.channel);
       }
@@ -316,10 +345,8 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       logger.warn(`Could not DM ${recipient.user_id}:`, err.message);
     }
   }
-  // Also post in a channel if requested
   if (alsoPostChannel) {
     try {
-      // Auto-join the channel if not already a member
       try { await client.conversations.join({ channel: alsoPostChannel }); } catch {}
       await client.chat.postMessage({
         channel: alsoPostChannel,
@@ -330,7 +357,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       logger.warn('Could not post to channel:', err.message);
     }
   }
-  // Confirm to sender
   const confirmBlocks = [
     {
       type: 'section',
@@ -373,7 +399,6 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
   await ack();
   const userId = body.user.id;
   const announcementId = action.value;
-  // Auto-add the user as a recipient if they clicked from a channel post (wasn't in the original list)
   let userName = body.user.name || userId;
   try {
     const info = await client.users.info({ user: userId });
@@ -382,7 +407,6 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
   await db.addRecipients(announcementId, [{ user_id: userId, user_name: userName }]);
   const alreadyRead = (await db.getRecipient(announcementId, userId))?.read_at;
   await db.markRead(announcementId, userId);
-  // Only notify sender + sync Notion on first read (not if they somehow click twice)
   if (!alreadyRead) {
     const stats = await db.getRecipientStats(announcementId);
     notion.markRecipientRead({ announcementId, userId, userName });
@@ -404,13 +428,9 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
     },
   ];
 
-  // FIX: Channel posts are shared — if clicked from a channel, do NOT update the channel
-  // message (that would remove the button for everyone). Instead update only their DM
-  // and send an ephemeral ack in the channel.
   const clickedInChannel = body.channel?.id && !body.channel.id.startsWith('D');
 
   if (clickedInChannel) {
-    // Send an ephemeral "got it" only visible to this user — channel post stays intact
     try {
       await client.chat.postEphemeral({
         channel: body.channel.id,
@@ -420,7 +440,6 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
     } catch (err) {
       logger.warn('Could not send ephemeral read confirmation:', err.message);
     }
-    // Update their DM if one exists
     try {
       const recipientInfo = await db.getRecipient(announcementId, userId);
       if (recipientInfo?.dm_ts && recipientInfo.dm_channel) {
@@ -444,7 +463,6 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
       logger.warn('Could not update DM after channel read:', err.message);
     }
   } else {
-    // Clicked from DM — update the DM in place (original behaviour)
     try {
       await client.chat.update({
         channel: body.channel.id,
@@ -456,7 +474,6 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
       logger.warn('Could not update DM on read:', err.message);
     }
   }
-  // Notify the sender of the read
   try {
     const announcement = await db.getAnnouncement(announcementId);
     const stats = await db.getRecipientStats(announcementId);
@@ -493,7 +510,6 @@ app.command('/announce-status', async ({ ack, body, client, logger }) => {
   const senderId = body.user.id;
   const args = (body.text || '').trim();
   if (args) {
-    // Look up a specific announcement by short ID prefix
     const recent = await db.getRecentAnnouncements(senderId, 20);
     const match = recent.find(a => a.id.startsWith(args) || a.id === args);
     if (match) {
@@ -505,7 +521,6 @@ app.command('/announce-status', async ({ ack, body, client, logger }) => {
       });
     }
   } else {
-    // Show list of recent announcements
     const recent = await db.getRecentAnnouncements(senderId, 10);
     if (recent.length === 0) {
       await client.chat.postMessage({
@@ -568,7 +583,6 @@ function buildAnnouncementBlocks(title, message, senderId, announcementId, group
       elements: [
         linkUrl
           ? {
-              // Link button: opens URL AND fires mark_as_read action simultaneously
               type: 'button',
               text: { type: 'plain_text', text: '📖 Open to Read', emoji: true },
               action_id: 'mark_as_read',
@@ -577,7 +591,6 @@ function buildAnnouncementBlocks(title, message, senderId, announcementId, group
               style: 'primary',
             }
           : {
-              // No link: standard read confirmation with confirm dialog
               type: 'button',
               text: { type: 'plain_text', text: '✅ Mark as Read', emoji: true },
               action_id: 'mark_as_read',
@@ -647,7 +660,6 @@ async function sendStatusReport(client, requesterId, announcementId, logger) {
       type: 'section',
       text: { type: 'mrkdwn', text: `*⏳ Not yet read (${pending.length}):*\n${pendingList}${pending.length > 20 ? `\n_...and ${pending.length - 20} more_` : ''}` },
     });
-    // Nudge button for non-readers
     blocks.push({
       type: 'actions',
       elements: [{
@@ -723,37 +735,10 @@ app.command('/radarpulse', async ({ ack, body, client, logger }) => {
 });
 async function openPulseModal({ client, triggerId, logger }) {
   try {
-    let ugOptions = [];
-    try {
-      const ugRes = await client.usergroups.list({ include_disabled: false });
-      ugOptions = (ugRes.usergroups || []).map(ug => ({
-        text: { type: 'plain_text', text: `${ug.name} (${ug.handle})`, emoji: true },
-        value: `slack_ug:${ug.id}:${ug.name}`,
-      }));
-    } catch (e) {
-      logger.warn('Could not fetch Slack usergroups:', e.message);
-    }
-    let channelOptions = [];
-    try {
-      const chanRes = await client.conversations.list({ types: 'public_channel,private_channel', limit: 200, exclude_archived: true });
-      const botChannels = (chanRes.channels || []).filter(c => c.is_member);
-      channelOptions = botChannels.slice(0, 50).map(c => ({
-        text: { type: 'plain_text', text: `#${c.name}`, emoji: true },
-        value: `channel:${c.id}:${c.name}`,
-      }));
-    } catch (e) {
-      logger.warn('Could not fetch channels:', e.message);
-    }
-    // Slack multi_static_select hard limit is 100 options total.
-    // Priority: ALL Slack usergroups first (no cap), then channels fill remaining slots.
-    const remainingSlots = Math.max(0, 100 - ugOptions.length);
-    const allOptions = [...ugOptions, ...channelOptions.slice(0, remainingSlots)].slice(0, 100);
-
-    // FIX: Store options in server-side cache, put only a short session ID in private_metadata.
-    // Slack's private_metadata limit is 3000 chars — allOptions easily exceeds that.
+    // No need to pre-load options — multi_external_select searches on demand.
+    // We still need a sessionId in private_metadata for modal rebuild state.
     const sessionId = randomUUID();
-    pulseModalCache.set(sessionId, { allOptions });
-    setTimeout(() => pulseModalCache.delete(sessionId), 60 * 60 * 1000); // auto-clean after 1hr
+    setTimeout(() => pulseModalCache.delete(sessionId), 60 * 60 * 1000);
 
     await client.views.open({
       trigger_id: triggerId,
@@ -763,7 +748,7 @@ async function openPulseModal({ client, triggerId, logger }) {
         title: { type: 'plain_text', text: '📊 Send Pulse', emoji: true },
         submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
         close: { type: 'plain_text', text: 'Cancel' },
-        blocks: buildPulseModalBlocks(allOptions),
+        blocks: buildPulseModalBlocks(),
         private_metadata: JSON.stringify({ sessionId }),
       },
     });
@@ -771,12 +756,16 @@ async function openPulseModal({ client, triggerId, logger }) {
     logger.error('Error opening pulse modal:', error);
   }
 }
+
+// Lightweight cache for pulse modal rebuild state (question count, label visibility)
+const pulseModalCache = new Map();
+
 // ------------------------------------------------------------
 //  buildPulseModalBlocks — dynamic growth version
 //  questionsVisible: how many question slots to render (1–5)
 //  visibleLabelBlocks: Set of block_ids that should show label fields
 // ------------------------------------------------------------
-function buildPulseModalBlocks(allOptions, questionsVisible = 1, visibleLabelBlocks = new Set()) {
+function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Set()) {
   const blocks = [
     {
       type: 'input',
@@ -789,23 +778,19 @@ function buildPulseModalBlocks(allOptions, questionsVisible = 1, visibleLabelBlo
       },
       label: { type: 'plain_text', text: '📌 Pulse Title', emoji: true },
     },
-  ];
-  if (allOptions.length > 0) {
-    blocks.push({
+    {
       type: 'input',
       block_id: 'pulse_audience_block',
       optional: true,
       element: {
-        type: 'multi_static_select',
+        type: 'multi_external_select',
         action_id: 'pulse_audience_select',
-        placeholder: { type: 'plain_text', text: 'Choose groups or channels...' },
-        options: allOptions,
+        placeholder: { type: 'plain_text', text: 'Search groups or channels...' },
+        min_query_length: 0,
       },
       label: { type: 'plain_text', text: '👥 Send to', emoji: true },
-      hint: { type: 'plain_text', text: 'Select one or more groups/channels, or add individuals below' },
-    });
-  }
-  blocks.push(
+      hint: { type: 'plain_text', text: 'Type to search Slack user groups and channels the bot is invited to' },
+    },
     {
       type: 'input',
       block_id: 'pulse_individuals_block',
@@ -830,14 +815,12 @@ function buildPulseModalBlocks(allOptions, questionsVisible = 1, visibleLabelBlo
       label: { type: 'plain_text', text: '📢 Also post in channel (optional)', emoji: true },
       hint: { type: 'plain_text', text: 'Post the pulse interactively in a channel so people can answer there too' },
     },
-    { type: 'divider' }
-  );
-  // Render question slots 1..questionsVisible
+    { type: 'divider' },
+  ];
   for (let i = 1; i <= questionsVisible; i++) {
     const required = i === 1;
     blocks.push(...buildQuestionBlocks(i, required, visibleLabelBlocks.has(`pulse_q${i}_type_block`)));
   }
-  // "+ Add question N" button for the next slot (if < 5 questions shown)
   if (questionsVisible < 5) {
     const next = questionsVisible + 1;
     blocks.push({
@@ -855,7 +838,6 @@ function buildPulseModalBlocks(allOptions, questionsVisible = 1, visibleLabelBlo
 }
 // ------------------------------------------------------------
 //  buildQuestionBlocks — renders one question slot
-//  showLabels: whether to include low/high label inputs
 // ------------------------------------------------------------
 function buildQuestionBlocks(num, required, showLabels = false) {
   const label = required ? `Question ${num}` : `Question ${num} (optional)`;
@@ -891,7 +873,6 @@ function buildQuestionBlocks(num, required, showLabels = false) {
       label: { type: 'plain_text', text: '📏 Response type', emoji: true },
     },
   ];
-  // Label fields only shown when a scale type is active
   if (showLabels) {
     blocks.push(
       {
@@ -927,7 +908,6 @@ function buildQuestionBlocks(num, required, showLabels = false) {
 // ============================================================
 function getPulseViewState(view) {
   const blocks = view.blocks || [];
-  // Count how many question text blocks are present
   let questionsVisible = 0;
   const visibleLabelBlocks = new Set();
   for (const b of blocks) {
@@ -935,7 +915,6 @@ function getPulseViewState(view) {
       questionsVisible++;
     }
     if (b.block_id && /^pulse_q\d+_type_block$/.test(b.block_id)) {
-      // Check if the corresponding low/high blocks are present
       const num = b.block_id.match(/pulse_q(\d+)_type_block/)[1];
       const hasLow = blocks.some(lb => lb.block_id === `pulse_q${num}_low_block`);
       if (hasLow) visibleLabelBlocks.add(`pulse_q${num}_type_block`);
@@ -950,19 +929,10 @@ app.action(/^add_question_(\d+)$/, async ({ ack, body, action, client, logger })
   await ack();
   const view = body.view;
   const { questionsVisible, visibleLabelBlocks } = getPulseViewState(view);
-  // The button tells us which question number to add
   const targetQ = parseInt(action.action_id.replace('add_question_', ''), 10);
-  // Only expand if this is the next logical slot
   const newVisible = Math.max(questionsVisible, targetQ);
 
-  // FIX: Read allOptions from server-side cache via sessionId instead of private_metadata
-  let allOptions = [];
-  try {
-    const meta = JSON.parse(view.private_metadata || '{}');
-    allOptions = (meta.sessionId && pulseModalCache.get(meta.sessionId)?.allOptions) || [];
-  } catch {}
-
-  const newBlocks = buildPulseModalBlocks(allOptions, newVisible, visibleLabelBlocks);
+  const newBlocks = buildPulseModalBlocks(newVisible, visibleLabelBlocks);
   try {
     await client.views.update({
       view_id: view.id,
@@ -974,7 +944,7 @@ app.action(/^add_question_(\d+)$/, async ({ ack, body, action, client, logger })
         submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
         close: { type: 'plain_text', text: 'Cancel' },
         blocks: newBlocks,
-        private_metadata: view.private_metadata, // pass sessionId through unchanged
+        private_metadata: view.private_metadata,
       },
     });
   } catch (err) {
@@ -997,14 +967,7 @@ app.action(/^pulse_q(\d+)_type_input$/, async ({ ack, body, action, client, logg
     visibleLabelBlocks.delete(typeBlockId);
   }
 
-  // FIX: Read allOptions from server-side cache via sessionId instead of private_metadata
-  let allOptions = [];
-  try {
-    const meta = JSON.parse(view.private_metadata || '{}');
-    allOptions = (meta.sessionId && pulseModalCache.get(meta.sessionId)?.allOptions) || [];
-  } catch {}
-
-  const newBlocks = buildPulseModalBlocks(allOptions, questionsVisible, visibleLabelBlocks);
+  const newBlocks = buildPulseModalBlocks(questionsVisible, visibleLabelBlocks);
   try {
     await client.views.update({
       view_id: view.id,
@@ -1016,7 +979,7 @@ app.action(/^pulse_q(\d+)_type_input$/, async ({ ack, body, action, client, logg
         submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
         close: { type: 'plain_text', text: 'Cancel' },
         blocks: newBlocks,
-        private_metadata: view.private_metadata, // pass sessionId through unchanged
+        private_metadata: view.private_metadata,
       },
     });
   } catch (err) {
@@ -1035,7 +998,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   const audienceValues = values.pulse_audience_block?.pulse_audience_select?.selected_options?.map(o => o.value) || [];
   const individualUsers = values.pulse_individuals_block?.pulse_individuals_input?.selected_users || [];
   const alsoPostChannel = values.pulse_also_post_block?.pulse_also_post_channel?.selected_conversation || null;
-  // Parse questions (1–5)
   const questions = [];
   for (let i = 1; i <= 5; i++) {
     const text = values[`pulse_q${i}_text_block`]?.[`pulse_q${i}_text_input`]?.value;
@@ -1061,7 +1023,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     });
     return;
   }
-  // Resolve audience
   const { userIds, groupName, targetType, targetRaw } = await resolvePulseAudience(client, audienceValues, individualUsers, senderId, logger);
   if (userIds.length === 0 && !alsoPostChannel) {
     await client.chat.postMessage({
@@ -1070,13 +1031,11 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     });
     return;
   }
-  // Fetch sender display name
   let senderDisplayName = senderName;
   try {
     const senderInfo = await client.users.info({ user: senderId });
     senderDisplayName = senderInfo.user?.profile?.real_name || senderInfo.user?.profile?.display_name || senderName;
   } catch {}
-  // Resolve recipient user info (filter bots/deactivated/sender)
   const recipientUsers = [];
   for (const uid of userIds) {
     try {
@@ -1100,7 +1059,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   }
   const campaignId = randomUUID();
   const sentAt = new Date().toISOString();
-  // Save campaign to Postgres
   await db.createPulseCampaign({
     id: campaignId,
     title,
@@ -1110,7 +1068,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     resolved_users: recipientUsers.map(u => u.user_id),
     questions,
   });
-  // Sync to Notion (non-blocking)
   notion.createPulseCampaignRow({
     campaignId,
     title,
@@ -1122,7 +1079,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   }).then(pageId => {
     if (pageId) db.updatePulseCampaignNotionId(campaignId, pageId);
   }).catch(err => logger.warn('Notion pulse campaign sync failed:', err.message));
-  // Send DM to each recipient with first question
   let sent = 0;
   for (const recipient of recipientUsers) {
     try {
@@ -1153,7 +1109,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
       logger.warn(`Could not DM pulse to ${recipient.user_id}:`, err.message);
     }
   }
-  // Also post in a channel if requested — fully interactive (same blocks as DM)
   if (alsoPostChannel) {
     try {
       try { await client.conversations.join({ channel: alsoPostChannel }); } catch {}
@@ -1163,7 +1118,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
         text: `📊 ${title} — pulse check-in from <@${senderId}>`,
         blocks: channelBlocks,
       });
-      // Store the channel post ts/channel on the campaign so handlePulseAnswer can update it
       if (channelResult?.ts) {
         await db.storePulseChannelPost(campaignId, channelResult.channel, channelResult.ts);
       }
@@ -1171,7 +1125,6 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
       logger.warn('Could not post pulse to channel:', err.message);
     }
   }
-  // Confirm to sender
   const confirmText = alsoPostChannel
     ? `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''} and posted in <#${alsoPostChannel}>.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`
     : `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`;
@@ -1191,11 +1144,9 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   });
 });
 // FIX: use regex to match pulse_scale_1 through pulse_scale_10
-// Each button needs a unique action_id — Slack rejects blocks with duplicate action_ids
 app.action(/^pulse_scale_\d+$/, async ({ ack, body, action, client, logger }) => {
   await ack();
   const userId = body.user.id;
-  // action.value format: "campaignId:questionIndex:score"
   const [campaignId, questionIndexStr, scoreStr] = (action.value || '').split(':');
   const questionIndex = parseInt(questionIndexStr, 10);
   const score = parseInt(scoreStr, 10);
@@ -1211,14 +1162,12 @@ app.action(/^pulse_scale_\d+$/, async ({ ack, body, action, client, logger }) =>
 app.action('pulse_text_submit', async ({ ack, body, action, client, logger }) => {
   await ack();
   const userId = body.user.id;
-  // action.value format: "campaignId:questionIndex"
   const [campaignId, questionIndexStr] = (action.value || '').split(':');
   const questionIndex = parseInt(questionIndexStr, 10);
   if (!campaignId || isNaN(questionIndex)) {
     logger.warn('pulse_text_submit: invalid action value', action.value);
     return;
   }
-  // Extract the text input value from the block state
   const blockId = `pulse_text_input_${questionIndex}`;
   const textValue = body.state?.values?.[blockId]?.pulse_text_value?.value || '';
   await handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer: textValue, score: null, body });
@@ -1240,7 +1189,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
     // in the original DM recipient list (or their DM failed). Auto-register them.
     if (!state) {
       logger.info(`handlePulseAnswer: no state for ${userId} — auto-registering from channel click`);
-      // Create a response row if one doesn't exist
       let existingResponse = await db.getPulseResponseByUser(campaignId, userId);
       if (!existingResponse) {
         let displayName = userId;
@@ -1256,7 +1204,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
           slack_display_name: displayName,
         });
       }
-      // Create state with no DM ts — answers will be sent as new DMs
       await db.createPulseState({
         id: randomUUID(),
         campaign_id: campaignId,
@@ -1271,20 +1218,17 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
       }
     }
 
-    // Guard: ignore stale button clicks (already moved past this question)
     if (questionIndex !== state.current_question_index) {
       logger.warn(`handlePulseAnswer: stale click — expected q${state.current_question_index}, got q${questionIndex}`);
       return;
     }
     const questions = campaign.questions;
     const currentQuestion = questions[questionIndex];
-    // Fetch the in-progress response row for this user + campaign
     const response = await db.getPulseResponseByUser(campaignId, userId);
     if (!response) {
       logger.warn(`handlePulseAnswer: no response row for ${userId} / ${campaignId}`);
       return;
     }
-    // Append this answer
     const answers = Array.isArray(response.answers) ? response.answers : [];
     answers[questionIndex] = {
       question_index: questionIndex,
@@ -1296,14 +1240,11 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
     await db.updatePulseResponseAnswers(response.id, answers);
     const nextIndex = questionIndex + 1;
     const isComplete = nextIndex >= questions.length;
-    // Determine whether the answer came from the channel post or a DM
     const clickedChannel = body?.channel?.id || body?.container?.channel_id;
     const answeredFromChannel = campaign.channel_post_channel && clickedChannel === campaign.channel_post_channel;
     if (isComplete) {
-      // All questions answered — complete the response
       await db.completePulseResponse(response.id);
       await db.deletePulseState(campaignId, userId);
-      // Sync to Notion (non-blocking)
       const respondedAt = new Date().toISOString();
       notion.createPulseResponseRow({
         campaignId,
@@ -1316,7 +1257,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
           await db.updatePulseResponseNotionId(response.id, responsePageId);
           await notion.updatePulseResponseAnswers({ responsePageId, answers });
         }
-        // Update respondent count on campaign
         if (campaign.notion_campaign_page_id) {
           const { rows: completedRows } = await db.countCompletedPulseResponses(campaignId);
           const count = completedRows?.[0]?.count ? parseInt(completedRows[0].count) : 1;
@@ -1344,7 +1284,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         },
       ];
       if (state.dm_channel && state.dm_ts) {
-        // Update existing DM thread with completion message
         try {
           await client.chat.update({
             channel: state.dm_channel,
@@ -1356,7 +1295,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
           logger.warn('Could not update pulse DM on completion:', err.message);
         }
       } else {
-        // No DM thread — send completion as a new DM (don't update shared channel post)
         try {
           await client.chat.postMessage({
             channel: userId,
@@ -1368,12 +1306,10 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         }
       }
     } else {
-      // Advance to next question
       await db.updatePulseStateQuestion(campaignId, userId, nextIndex);
       const nextBlocks = buildPulseDMBlocks(campaign, nextIndex, null);
 
       if (state.dm_channel && state.dm_ts) {
-        // Has an existing DM thread — update it in place
         try {
           await client.chat.update({
             channel: state.dm_channel,
@@ -1385,15 +1321,12 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
           logger.warn('Could not update pulse DM for next question:', err.message);
         }
       } else {
-        // No DM thread (user answered from channel post) — send next question as a new DM
-        // This avoids updating the shared channel post which would affect all respondents
         try {
           const dmResult = await client.chat.postMessage({
             channel: userId,
             text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
             blocks: nextBlocks,
           });
-          // Store the DM ts so subsequent questions can update in place
           if (dmResult?.ts) {
             await db.createPulseState({
               id: randomUUID(),
@@ -1436,7 +1369,6 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
     },
   ];
   if (question.response_type === 'scale_10') {
-    // Low/high labels
     if (question.low_label || question.high_label) {
       blocks.push({
         type: 'context',
@@ -1446,9 +1378,6 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
         }],
       });
     }
-    // Two rows of buttons: 1-5 and 6-10
-    // Each button gets a unique action_id (pulse_scale_1 … pulse_scale_10)
-    // Slack rejects messages with duplicate action_ids
     blocks.push({
       type: 'actions',
       elements: [1, 2, 3, 4, 5].map(n => ({
@@ -1487,7 +1416,6 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
       })),
     });
   } else {
-    // Free text
     const blockId = `pulse_text_input_${questionIndex}`;
     blocks.push({
       type: 'input',
