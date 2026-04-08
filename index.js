@@ -919,6 +919,8 @@ async function openPulseModal({ client, triggerId, logger }) {
         submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
         close: { type: 'plain_text', text: 'Cancel' },
         blocks: buildPulseModalBlocks(allOptions),
+        // Stash serialised options so view.update handlers can rebuild the audience block
+        private_metadata: JSON.stringify({ allOptions }),
       },
     });
   } catch (error) {
@@ -926,7 +928,12 @@ async function openPulseModal({ client, triggerId, logger }) {
   }
 }
 
-function buildPulseModalBlocks(allOptions) {
+// ------------------------------------------------------------
+//  buildPulseModalBlocks — dynamic growth version
+//  questionsVisible: how many question slots to render (1–5)
+//  visibleLabelBlocks: Set of block_ids that should show label fields
+// ------------------------------------------------------------
+function buildPulseModalBlocks(allOptions, questionsVisible = 1, visibleLabelBlocks = new Set()) {
   const blocks = [
     {
       type: 'input',
@@ -957,34 +964,65 @@ function buildPulseModalBlocks(allOptions) {
     });
   }
 
-  blocks.push({
-    type: 'input',
-    block_id: 'pulse_individuals_block',
-    optional: true,
-    element: {
-      type: 'multi_users_select',
-      action_id: 'pulse_individuals_input',
-      placeholder: { type: 'plain_text', text: 'Add specific people (optional)' },
+  blocks.push(
+    {
+      type: 'input',
+      block_id: 'pulse_individuals_block',
+      optional: true,
+      element: {
+        type: 'multi_users_select',
+        action_id: 'pulse_individuals_input',
+        placeholder: { type: 'plain_text', text: 'Add specific people (optional)' },
+      },
+      label: { type: 'plain_text', text: '🙋 Also send to individuals', emoji: true },
     },
-    label: { type: 'plain_text', text: '🙋 Also send to individuals', emoji: true },
-  });
+    {
+      type: 'input',
+      block_id: 'pulse_also_post_block',
+      optional: true,
+      element: {
+        type: 'conversations_select',
+        action_id: 'pulse_also_post_channel',
+        placeholder: { type: 'plain_text', text: 'Pick a channel (optional)' },
+        filter: { include: ['public', 'private'] },
+      },
+      label: { type: 'plain_text', text: '📢 Also post in channel (optional)', emoji: true },
+      hint: { type: 'plain_text', text: 'Post the pulse interactively in a channel so people can answer there too' },
+    },
+    { type: 'divider' }
+  );
 
-  blocks.push({ type: 'divider' });
+  // Render question slots 1..questionsVisible
+  for (let i = 1; i <= questionsVisible; i++) {
+    const required = i === 1;
+    blocks.push(...buildQuestionBlocks(i, required, visibleLabelBlocks.has(`pulse_q${i}_type_block`)));
+  }
 
-  // Question 1 (required)
-  blocks.push(...buildQuestionBlocks(1, true));
-
-  // Questions 2–5 (optional)
-  for (let i = 2; i <= 5; i++) {
-    blocks.push(...buildQuestionBlocks(i, false));
+  // "+ Add question N" button for the next slot (if < 5 questions shown)
+  if (questionsVisible < 5) {
+    const next = questionsVisible + 1;
+    blocks.push({
+      type: 'actions',
+      block_id: `pulse_add_q${next}_block`,
+      elements: [{
+        type: 'button',
+        text: { type: 'plain_text', text: `➕ Add question ${next}`, emoji: true },
+        action_id: `add_question_${next}`,
+        value: `add_${next}`,
+      }],
+    });
   }
 
   return blocks;
 }
 
-function buildQuestionBlocks(num, required) {
+// ------------------------------------------------------------
+//  buildQuestionBlocks — renders one question slot
+//  showLabels: whether to include low/high label inputs
+// ------------------------------------------------------------
+function buildQuestionBlocks(num, required, showLabels = false) {
   const label = required ? `Question ${num}` : `Question ${num} (optional)`;
-  return [
+  const blocks = [
     {
       type: 'input',
       block_id: `pulse_q${num}_text_block`,
@@ -1001,6 +1039,7 @@ function buildQuestionBlocks(num, required) {
       type: 'input',
       block_id: `pulse_q${num}_type_block`,
       optional: !required,
+      dispatch_action: true,
       element: {
         type: 'static_select',
         action_id: `pulse_q${num}_type_input`,
@@ -1014,32 +1053,152 @@ function buildQuestionBlocks(num, required) {
       },
       label: { type: 'plain_text', text: '📏 Response type', emoji: true },
     },
-    {
-      type: 'input',
-      block_id: `pulse_q${num}_low_block`,
-      optional: true,
-      element: {
-        type: 'plain_text_input',
-        action_id: `pulse_q${num}_low_input`,
-        placeholder: { type: 'plain_text', text: 'e.g. Not at all' },
-        max_length: 50,
-      },
-      label: { type: 'plain_text', text: `↙️ Low label (scale only, optional)`, emoji: true },
-    },
-    {
-      type: 'input',
-      block_id: `pulse_q${num}_high_block`,
-      optional: true,
-      element: {
-        type: 'plain_text_input',
-        action_id: `pulse_q${num}_high_input`,
-        placeholder: { type: 'plain_text', text: 'e.g. Extremely' },
-        max_length: 50,
-      },
-      label: { type: 'plain_text', text: `↗️ High label (scale only, optional)`, emoji: true },
-    },
   ];
+
+  // Label fields only shown when a scale type is active
+  if (showLabels) {
+    blocks.push(
+      {
+        type: 'input',
+        block_id: `pulse_q${num}_low_block`,
+        optional: true,
+        element: {
+          type: 'plain_text_input',
+          action_id: `pulse_q${num}_low_input`,
+          placeholder: { type: 'plain_text', text: 'e.g. Not at all' },
+          max_length: 50,
+        },
+        label: { type: 'plain_text', text: `↙️ Low label (optional)`, emoji: true },
+      },
+      {
+        type: 'input',
+        block_id: `pulse_q${num}_high_block`,
+        optional: true,
+        element: {
+          type: 'plain_text_input',
+          action_id: `pulse_q${num}_high_input`,
+          placeholder: { type: 'plain_text', text: 'e.g. Extremely' },
+          max_length: 50,
+        },
+        label: { type: 'plain_text', text: `↗️ High label (optional)`, emoji: true },
+      }
+    );
+  }
+
+  return blocks;
 }
+
+// ============================================================
+//  Helper: derive current modal state from view blocks
+// ============================================================
+
+function getPulseViewState(view) {
+  const blocks = view.blocks || [];
+  // Count how many question text blocks are present
+  let questionsVisible = 0;
+  const visibleLabelBlocks = new Set();
+  for (const b of blocks) {
+    if (b.block_id && /^pulse_q\d+_text_block$/.test(b.block_id)) {
+      questionsVisible++;
+    }
+    if (b.block_id && /^pulse_q\d+_type_block$/.test(b.block_id)) {
+      // Check if the corresponding low/high blocks are present
+      const num = b.block_id.match(/pulse_q(\d+)_type_block/)[1];
+      const hasLow = blocks.some(lb => lb.block_id === `pulse_q${num}_low_block`);
+      if (hasLow) visibleLabelBlocks.add(`pulse_q${num}_type_block`);
+    }
+  }
+  return { questionsVisible: Math.max(questionsVisible, 1), visibleLabelBlocks };
+}
+
+// ============================================================
+//  block_actions: "+ Add question N" buttons
+// ============================================================
+
+app.action(/^add_question_(\d+)$/, async ({ ack, body, action, client, logger }) => {
+  await ack();
+
+  const view = body.view;
+  const { questionsVisible, visibleLabelBlocks } = getPulseViewState(view);
+
+  // The button tells us which question number to add
+  const targetQ = parseInt(action.action_id.replace('add_question_', ''), 10);
+  // Only expand if this is the next logical slot
+  const newVisible = Math.max(questionsVisible, targetQ);
+
+  let allOptions = [];
+  try {
+    const meta = JSON.parse(view.private_metadata || '{}');
+    allOptions = meta.allOptions || [];
+  } catch {}
+
+  const newBlocks = buildPulseModalBlocks(allOptions, newVisible, visibleLabelBlocks);
+
+  try {
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: {
+        type: 'modal',
+        callback_id: 'pulse_modal_submit',
+        title: { type: 'plain_text', text: '📊 Send Pulse', emoji: true },
+        submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: newBlocks,
+        private_metadata: view.private_metadata,
+      },
+    });
+  } catch (err) {
+    logger.error('add_question view.update error:', err);
+  }
+});
+
+// ============================================================
+//  block_actions: response type dropdown — smart label reveal
+// ============================================================
+
+app.action(/^pulse_q(\d+)_type_input$/, async ({ ack, body, action, client, logger }) => {
+  await ack();
+
+  const view = body.view;
+  const num = action.action_id.match(/pulse_q(\d+)_type_input/)[1];
+  const selectedType = action.selected_option?.value;
+
+  const { questionsVisible, visibleLabelBlocks } = getPulseViewState(view);
+
+  const typeBlockId = `pulse_q${num}_type_block`;
+  if (selectedType === 'scale_10' || selectedType === 'scale_5') {
+    visibleLabelBlocks.add(typeBlockId);
+  } else {
+    visibleLabelBlocks.delete(typeBlockId);
+  }
+
+  let allOptions = [];
+  try {
+    const meta = JSON.parse(view.private_metadata || '{}');
+    allOptions = meta.allOptions || [];
+  } catch {}
+
+  const newBlocks = buildPulseModalBlocks(allOptions, questionsVisible, visibleLabelBlocks);
+
+  try {
+    await client.views.update({
+      view_id: view.id,
+      hash: view.hash,
+      view: {
+        type: 'modal',
+        callback_id: 'pulse_modal_submit',
+        title: { type: 'plain_text', text: '📊 Send Pulse', emoji: true },
+        submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: newBlocks,
+        private_metadata: view.private_metadata,
+      },
+    });
+  } catch (err) {
+    logger.error('pulse type dropdown view.update error:', err);
+  }
+});
 
 // ============================================================
 //  Pulse modal submission
@@ -1055,6 +1214,7 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   const title = values.pulse_title_block.pulse_title_input.value;
   const audienceValues = values.pulse_audience_block?.pulse_audience_select?.selected_options?.map(o => o.value) || [];
   const individualUsers = values.pulse_individuals_block?.pulse_individuals_input?.selected_users || [];
+  const alsoPostChannel = values.pulse_also_post_block?.pulse_also_post_channel?.selected_conversation || null;
 
   // Parse questions (1–5)
   const questions = [];
@@ -1076,11 +1236,11 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     return;
   }
 
-  const hasAudience = audienceValues.length > 0 || individualUsers.length > 0;
+  const hasAudience = audienceValues.length > 0 || individualUsers.length > 0 || alsoPostChannel;
   if (!hasAudience) {
     await client.chat.postMessage({
       channel: senderId,
-      text: '❌ No audience selected. Pick a group or add individuals.',
+      text: '❌ No audience selected. Pick a group, add individuals, or choose a channel to post in.',
     });
     return;
   }
@@ -1088,10 +1248,10 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   // Resolve audience
   const { userIds, groupName, targetType, targetRaw } = await resolvePulseAudience(client, audienceValues, individualUsers, senderId, logger);
 
-  if (userIds.length === 0) {
+  if (userIds.length === 0 && !alsoPostChannel) {
     await client.chat.postMessage({
       channel: senderId,
-      text: `❌ Couldn't resolve any recipients. Check the group has members or add individuals.`,
+      text: `❌ Couldn't resolve any recipients. Check the group has members, add individuals, or pick a channel to post in.`,
     });
     return;
   }
@@ -1119,7 +1279,7 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     }
   }
 
-  if (recipientUsers.length === 0) {
+  if (recipientUsers.length === 0 && !alsoPostChannel) {
     await client.chat.postMessage({
       channel: senderId,
       text: `❌ No valid recipients found after filtering bots and inactive users.`,
@@ -1189,7 +1349,30 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     }
   }
 
+  // Also post in a channel if requested — fully interactive (same blocks as DM)
+  if (alsoPostChannel) {
+    try {
+      try { await client.conversations.join({ channel: alsoPostChannel }); } catch {}
+      const channelBlocks = buildPulseDMBlocks({ id: campaignId, title, questions }, 0, null);
+      const channelResult = await client.chat.postMessage({
+        channel: alsoPostChannel,
+        text: `📊 ${title} — pulse check-in from <@${senderId}>`,
+        blocks: channelBlocks,
+      });
+      // Store the channel post ts/channel on the campaign so handlePulseAnswer can update it
+      if (channelResult?.ts) {
+        await db.storePulseChannelPost(campaignId, channelResult.channel, channelResult.ts);
+      }
+    } catch (err) {
+      logger.warn('Could not post pulse to channel:', err.message);
+    }
+  }
+
   // Confirm to sender
+  const confirmText = alsoPostChannel
+    ? `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''} and posted in <#${alsoPostChannel}>.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`
+    : `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`;
+
   await client.chat.postMessage({
     channel: senderId,
     text: `✅ Pulse *"${title}"* sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.`,
@@ -1200,20 +1383,15 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
       },
       {
         type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`,
-        },
+        text: { type: 'mrkdwn', text: confirmText },
       },
     ],
   });
 });
 
-// ============================================================
-//  Pulse: scale button click (1-10 or 1-5)
-// ============================================================
 
 app.action('pulse_scale_button', async ({ ack, body, action, client, logger }) => {
+
   await ack();
 
   const userId = body.user.id;
@@ -1302,6 +1480,10 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
     const nextIndex = questionIndex + 1;
     const isComplete = nextIndex >= questions.length;
 
+    // Determine whether the answer came from the channel post or a DM
+    const clickedChannel = body?.channel?.id || body?.container?.channel_id;
+    const answeredFromChannel = campaign.channel_post_channel && clickedChannel === campaign.channel_post_channel;
+
     if (isComplete) {
       // All questions answered — complete the response
       await db.completePulseResponse(response.id);
@@ -1321,7 +1503,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         }
         // Update respondent count on campaign
         if (campaign.notion_campaign_page_id) {
-          // Count completed responses
           const { rows: completedRows } = await db.countCompletedPulseResponses(campaignId);
           const count = completedRows?.[0]?.count ? parseInt(completedRows[0].count) : 1;
           await notion.updatePulseCampaignRespondentCount({
@@ -1331,7 +1512,6 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         }
       }).catch(err => logger.warn('Notion pulse response sync failed:', err.message));
 
-      // Update DM with completion message
       const completionBlocks = [
         {
           type: 'header',
@@ -1350,15 +1530,32 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         },
       ];
 
-      try {
-        await client.chat.update({
-          channel: state.dm_channel,
-          ts: state.dm_ts,
-          text: `🎉 Thanks for completing "${campaign.title}"!`,
-          blocks: completionBlocks,
-        });
-      } catch (err) {
-        logger.warn('Could not update pulse DM on completion:', err.message);
+      // Update the DM (always, if it exists)
+      if (state.dm_channel && state.dm_ts) {
+        try {
+          await client.chat.update({
+            channel: state.dm_channel,
+            ts: state.dm_ts,
+            text: `🎉 Thanks for completing "${campaign.title}"!`,
+            blocks: completionBlocks,
+          });
+        } catch (err) {
+          logger.warn('Could not update pulse DM on completion:', err.message);
+        }
+      }
+
+      // Also update the channel post if the answer came from there
+      if (answeredFromChannel && campaign.channel_post_ts) {
+        try {
+          await client.chat.update({
+            channel: campaign.channel_post_channel,
+            ts: campaign.channel_post_ts,
+            text: `🎉 Thanks for completing "${campaign.title}"!`,
+            blocks: completionBlocks,
+          });
+        } catch (err) {
+          logger.warn('Could not update pulse channel post on completion:', err.message);
+        }
       }
 
     } else {
@@ -1366,20 +1563,39 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
       await db.updatePulseStateQuestion(campaignId, userId, nextIndex);
 
       const nextBlocks = buildPulseDMBlocks(campaign, nextIndex, null);
-      try {
-        await client.chat.update({
-          channel: state.dm_channel,
-          ts: state.dm_ts,
-          text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
-          blocks: nextBlocks,
-        });
-      } catch (err) {
-        logger.warn('Could not update pulse DM for next question:', err.message);
+
+      // Update the DM (always, if it exists)
+      if (state.dm_channel && state.dm_ts) {
+        try {
+          await client.chat.update({
+            channel: state.dm_channel,
+            ts: state.dm_ts,
+            text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
+            blocks: nextBlocks,
+          });
+        } catch (err) {
+          logger.warn('Could not update pulse DM for next question:', err.message);
+        }
+      }
+
+      // Also update the channel post if the answer came from there
+      if (answeredFromChannel && campaign.channel_post_ts) {
+        try {
+          await client.chat.update({
+            channel: campaign.channel_post_channel,
+            ts: campaign.channel_post_ts,
+            text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
+            blocks: nextBlocks,
+          });
+        } catch (err) {
+          logger.warn('Could not update pulse channel post for next question:', err.message);
+        }
       }
     }
   } catch (err) {
     logger.error('handlePulseAnswer error:', err);
   }
+
 }
 
 // ============================================================
