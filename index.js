@@ -1308,11 +1308,44 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
       logger.warn(`handlePulseAnswer: campaign ${campaignId} not found`);
       return;
     }
-    const state = await db.getPulseState(campaignId, userId);
+
+    let state = await db.getPulseState(campaignId, userId);
+
+    // FIX: If no state exists, this user clicked from the channel post but wasn't
+    // in the original DM recipient list (or their DM failed). Auto-register them.
     if (!state) {
-      logger.warn(`handlePulseAnswer: no pulse state for ${userId} / ${campaignId}`);
-      return;
+      logger.info(`handlePulseAnswer: no state for ${userId} — auto-registering from channel click`);
+      // Create a response row if one doesn't exist
+      let existingResponse = await db.getPulseResponseByUser(campaignId, userId);
+      if (!existingResponse) {
+        let displayName = userId;
+        try {
+          const info = await client.users.info({ user: userId });
+          displayName = info.user?.profile?.real_name || info.user?.profile?.display_name || info.user?.name || userId;
+        } catch {}
+        const responseId = randomUUID();
+        await db.createPulseResponse({
+          id: responseId,
+          campaign_id: campaignId,
+          slack_user_id: userId,
+          slack_display_name: displayName,
+        });
+      }
+      // Create state with no DM ts — answers will be sent as new DMs
+      await db.createPulseState({
+        id: randomUUID(),
+        campaign_id: campaignId,
+        slack_user_id: userId,
+        dm_ts: null,
+        dm_channel: null,
+      });
+      state = await db.getPulseState(campaignId, userId);
+      if (!state) {
+        logger.warn(`handlePulseAnswer: could not create state for ${userId}`);
+        return;
+      }
     }
+
     // Guard: ignore stale button clicks (already moved past this question)
     if (questionIndex !== state.current_question_index) {
       logger.warn(`handlePulseAnswer: stale click — expected q${state.current_question_index}, got q${questionIndex}`);
@@ -1384,8 +1417,8 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
           elements: [{ type: 'mrkdwn', text: `${buildPulseProgressBar(questions.length, questions.length)} ${questions.length}/${questions.length} questions answered` }],
         },
       ];
-      // Update the DM (always, if it exists)
       if (state.dm_channel && state.dm_ts) {
+        // Update existing DM thread with completion message
         try {
           await client.chat.update({
             channel: state.dm_channel,
@@ -1396,26 +1429,25 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         } catch (err) {
           logger.warn('Could not update pulse DM on completion:', err.message);
         }
-      }
-      // Also update the channel post if the answer came from there
-      if (answeredFromChannel && campaign.channel_post_ts) {
+      } else {
+        // No DM thread — send completion as a new DM (don't update shared channel post)
         try {
-          await client.chat.update({
-            channel: campaign.channel_post_channel,
-            ts: campaign.channel_post_ts,
+          await client.chat.postMessage({
+            channel: userId,
             text: `🎉 Thanks for completing "${campaign.title}"!`,
             blocks: completionBlocks,
           });
         } catch (err) {
-          logger.warn('Could not update pulse channel post on completion:', err.message);
+          logger.warn('Could not send completion DM:', err.message);
         }
       }
     } else {
       // Advance to next question
       await db.updatePulseStateQuestion(campaignId, userId, nextIndex);
       const nextBlocks = buildPulseDMBlocks(campaign, nextIndex, null);
-      // Update the DM (always, if it exists)
+
       if (state.dm_channel && state.dm_ts) {
+        // Has an existing DM thread — update it in place
         try {
           await client.chat.update({
             channel: state.dm_channel,
@@ -1426,18 +1458,27 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         } catch (err) {
           logger.warn('Could not update pulse DM for next question:', err.message);
         }
-      }
-      // Also update the channel post if the answer came from there
-      if (answeredFromChannel && campaign.channel_post_ts) {
+      } else {
+        // No DM thread (user answered from channel post) — send next question as a new DM
+        // This avoids updating the shared channel post which would affect all respondents
         try {
-          await client.chat.update({
-            channel: campaign.channel_post_channel,
-            ts: campaign.channel_post_ts,
+          const dmResult = await client.chat.postMessage({
+            channel: userId,
             text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
             blocks: nextBlocks,
           });
+          // Store the DM ts so subsequent questions can update in place
+          if (dmResult?.ts) {
+            await db.createPulseState({
+              id: randomUUID(),
+              campaign_id: campaignId,
+              slack_user_id: userId,
+              dm_ts: dmResult.ts,
+              dm_channel: dmResult.channel,
+            });
+          }
         } catch (err) {
-          logger.warn('Could not update pulse channel post for next question:', err.message);
+          logger.warn('Could not send next question DM:', err.message);
         }
       }
     }
