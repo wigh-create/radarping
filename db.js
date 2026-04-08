@@ -63,9 +63,18 @@ async function initSchema() {
       resolved_users TEXT NOT NULL DEFAULT '[]',
       questions TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
-      notion_campaign_page_id TEXT
+      notion_campaign_page_id TEXT,
+      channel_post_channel TEXT,
+      channel_post_ts TEXT
     )
   `);
+
+  // Migrate existing tables: add channel post columns if they don't exist yet
+  await pool.query(`
+    ALTER TABLE pulse_campaigns
+      ADD COLUMN IF NOT EXISTS channel_post_channel TEXT,
+      ADD COLUMN IF NOT EXISTS channel_post_ts TEXT
+  `).catch(() => {});
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pulse_responses (
@@ -262,6 +271,13 @@ async function updatePulseCampaignNotionId(id, notionPageId) {
   );
 }
 
+async function storePulseChannelPost(campaignId, channelId, ts) {
+  await pool.query(
+    `UPDATE pulse_campaigns SET channel_post_channel = $1, channel_post_ts = $2 WHERE id = $3`,
+    [channelId, ts, campaignId]
+  );
+}
+
 // ============================================================
 //  Pulse Responses
 // ============================================================
@@ -379,6 +395,7 @@ module.exports = {
   createPulseCampaign,
   getPulseCampaign,
   updatePulseCampaignNotionId,
+  storePulseChannelPost,
   createPulseResponse,
   getPulseResponse,
   getPulseResponseByUser,
