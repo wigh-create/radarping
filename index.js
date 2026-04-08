@@ -415,40 +415,58 @@ app.action('mark_as_read', async ({ ack, body, action, client, logger }) => {
       }],
     },
   ];
-  // Update the message where the button was clicked
-  try {
-    await client.chat.update({
-      channel: body.channel.id,
-      ts: body.message.ts,
-      text: '✅ You\'ve confirmed you\'ve read this announcement.',
-      blocks: readBlocks(body.message.blocks),
-    });
-  } catch (err) {
-    logger.warn('Could not update clicked message:', err.message);
-  }
-  // Also update the DM if they clicked from a channel (or the channel post if they clicked from DM)
-  try {
-    const recipientInfo = await db.getRecipient(announcementId, userId);
-    if (recipientInfo?.dm_ts && recipientInfo.dm_channel !== body.channel.id) {
-      // Clicked from channel — update their DM too
-      const dmMsg = await client.conversations.history({
-        channel: recipientInfo.dm_channel,
-        latest: recipientInfo.dm_ts,
-        limit: 1,
-        inclusive: true,
+
+  // FIX: Channel posts are shared — if clicked from a channel, do NOT update the channel
+  // message (that would remove the button for everyone). Instead update only their DM
+  // and send an ephemeral ack in the channel.
+  const clickedInChannel = body.channel?.id && !body.channel.id.startsWith('D');
+
+  if (clickedInChannel) {
+    // Send an ephemeral "got it" only visible to this user — channel post stays intact
+    try {
+      await client.chat.postEphemeral({
+        channel: body.channel.id,
+        user: userId,
+        text: `✅ Got it — marked as read.`,
       });
-      const dmBlocks = dmMsg?.messages?.[0]?.blocks;
-      if (dmBlocks) {
-        await client.chat.update({
-          channel: recipientInfo.dm_channel,
-          ts: recipientInfo.dm_ts,
-          text: '✅ You\'ve confirmed you\'ve read this announcement.',
-          blocks: readBlocks(dmBlocks),
-        });
-      }
+    } catch (err) {
+      logger.warn('Could not send ephemeral read confirmation:', err.message);
     }
-  } catch (err) {
-    logger.warn('Could not update DM after channel read:', err.message);
+    // Update their DM if one exists
+    try {
+      const recipientInfo = await db.getRecipient(announcementId, userId);
+      if (recipientInfo?.dm_ts && recipientInfo.dm_channel) {
+        const dmMsg = await client.conversations.history({
+          channel: recipientInfo.dm_channel,
+          latest: recipientInfo.dm_ts,
+          limit: 1,
+          inclusive: true,
+        });
+        const dmBlocks = dmMsg?.messages?.[0]?.blocks;
+        if (dmBlocks) {
+          await client.chat.update({
+            channel: recipientInfo.dm_channel,
+            ts: recipientInfo.dm_ts,
+            text: '✅ You\'ve confirmed you\'ve read this announcement.',
+            blocks: readBlocks(dmBlocks),
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn('Could not update DM after channel read:', err.message);
+    }
+  } else {
+    // Clicked from DM — update the DM in place (original behaviour)
+    try {
+      await client.chat.update({
+        channel: body.channel.id,
+        ts: body.message.ts,
+        text: '✅ You\'ve confirmed you\'ve read this announcement.',
+        blocks: readBlocks(body.message.blocks),
+      });
+    } catch (err) {
+      logger.warn('Could not update DM on read:', err.message);
+    }
   }
   // Notify the sender of the read
   try {
