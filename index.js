@@ -4,7 +4,6 @@
  * Commands:
  *   /announce        - Compose and send an announcement to groups
  *   /announce-status - Check read receipts for your announcements
- *   /groups          - Manage your custom recipient groups
  */
 require('dotenv').config();
 const { App } = require('@slack/bolt');
@@ -39,23 +38,21 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
     } catch (e) {
       logger.warn('Could not fetch Slack usergroups:', e.message);
     }
-    const customGroups = await db.getGroups();
-    const customOptions = customGroups.map(g => ({
-      text: { type: 'plain_text', text: `📋 ${g.name} (custom, ${g.member_ids.length} members)`, emoji: true },
-      value: `custom:${g.id}:${g.name}`,
-    }));
     let channelOptions = [];
     try {
       const chanRes = await client.conversations.list({ types: 'public_channel,private_channel', limit: 200, exclude_archived: true });
       const botChannels = (chanRes.channels || []).filter(c => c.is_member);
-      channelOptions = botChannels.slice(0, 20).map(c => ({
+      channelOptions = botChannels.slice(0, 50).map(c => ({
         text: { type: 'plain_text', text: `#${c.name}`, emoji: true },
         value: `channel:${c.id}:${c.name}`,
       }));
     } catch (e) {
       logger.warn('Could not fetch channels:', e.message);
     }
-    const allOptions = [...ugOptions.slice(0, 60), ...customOptions.slice(0, 20), ...channelOptions.slice(0, 19)];
+    // Slack multi_static_select hard limit is 100 options total.
+    // Priority: ALL Slack usergroups first (no cap), then channels fill remaining slots.
+    const remainingSlots = Math.max(0, 100 - ugOptions.length);
+    const allOptions = [...ugOptions, ...channelOptions.slice(0, remainingSlots)].slice(0, 100);
     const blocks = [
       {
         type: 'input',
@@ -225,15 +222,6 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
         hasNonChannelAudience = true;
         const membersRes = await client.usergroups.users.list({ usergroup: ugId });
         userIds = userIds.concat(membersRes.users || []);
-      } else if (audienceValue.startsWith('custom:')) {
-        // Custom in-app group
-        const [, groupId, gName] = audienceValue.split(':');
-        groupNameParts.push(gName);
-        targetType = 'custom';
-        targetId = groupId;
-        hasNonChannelAudience = true;
-        const group = await db.getGroup(groupId);
-        userIds = userIds.concat(group ? group.member_ids : []);
       } else if (audienceValue.startsWith('channel:')) {
         // Channel — get members and require read receipts from all of them
         const [, channelId, chanName] = audienceValue.split(':');
@@ -557,85 +545,6 @@ app.command('/announce-status', async ({ ack, body, client, logger }) => {
   }
 });
 // ============================================================
-//  /groups - Manage custom recipient groups
-// ============================================================
-app.command('/groups', async ({ ack, body, client, logger }) => {
-  await ack();
-  const senderId = body.user.id;
-  const args = (body.text || '').trim().split(/\s+/);
-  const subcommand = args[0]?.toLowerCase();
-  if (subcommand === 'create') {
-    // /groups create "Group Name" @user1 @user2
-    await client.views.open({
-      trigger_id: body.trigger_id,
-      view: {
-        type: 'modal',
-        callback_id: 'create_group_modal',
-        title: { type: 'plain_text', text: '👥 Create Group', emoji: true },
-        submit: { type: 'plain_text', text: 'Create', emoji: true },
-        close: { type: 'plain_text', text: 'Cancel' },
-        blocks: [
-          {
-            type: 'input',
-            block_id: 'group_name_block',
-            element: {
-              type: 'plain_text_input',
-              action_id: 'group_name_input',
-              placeholder: { type: 'plain_text', text: 'e.g. UK Sales Team, EMEA Managers...' },
-            },
-            label: { type: 'plain_text', text: 'Group Name', emoji: true },
-          },
-          {
-            type: 'input',
-            block_id: 'group_members_block',
-            element: {
-              type: 'multi_users_select',
-              action_id: 'group_members_input',
-              placeholder: { type: 'plain_text', text: 'Search for team members...' },
-            },
-            label: { type: 'plain_text', text: 'Members', emoji: true },
-          },
-        ],
-      },
-    });
-  } else if (subcommand === 'delete' && args[1]) {
-    const groupId = args[1];
-    await db.deleteGroup(groupId);
-    await client.chat.postMessage({ channel: senderId, text: `🗑️ Group deleted.` });
-  } else {
-    // List groups
-    const groups = await db.getGroups();
-    if (groups.length === 0) {
-      await client.chat.postMessage({
-        channel: senderId,
-        text: '📭 No custom groups yet.\n\nUse `/groups create` to create one — or just use Slack User Groups and channels, which are auto-detected in `/announce`.',
-      });
-      return;
-    }
-    const lines = groups.map(g => `• *${g.name}* — ${g.member_ids.length} members (ID: \`${g.id.slice(0, 8)}\`)`).join('\n');
-    await client.chat.postMessage({
-      channel: senderId,
-      text: `👥 *Your Custom Groups:*\n${lines}\n\n_Use \`/groups create\` to add a new group, or \`/groups delete <id>\` to remove one._`,
-    });
-  }
-});
-// ============================================================
-//  Create group modal submit
-// ============================================================
-app.view('create_group_modal', async ({ ack, body, view, client, logger }) => {
-  await ack();
-  const createdBy = body.user.id;
-  const values = view.state.values;
-  const name = values.group_name_block.group_name_input.value;
-  const memberIds = values.group_members_block.group_members_input.selected_users || [];
-  const id = randomUUID();
-  await db.saveGroup({ id, name, member_ids: memberIds, created_by: createdBy });
-  await client.chat.postMessage({
-    channel: createdBy,
-    text: `✅ Group *${name}* created with ${memberIds.length} members.\n\nNow use \`/announce\` and you'll see this group in the audience picker!`,
-  });
-});
-// ============================================================
 //  Helpers
 // ============================================================
 function buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl = null) {
@@ -824,23 +733,21 @@ async function openPulseModal({ client, triggerId, logger }) {
     } catch (e) {
       logger.warn('Could not fetch Slack usergroups:', e.message);
     }
-    const customGroups = await db.getGroups();
-    const customOptions = customGroups.map(g => ({
-      text: { type: 'plain_text', text: `📋 ${g.name} (custom, ${g.member_ids.length} members)`, emoji: true },
-      value: `custom:${g.id}:${g.name}`,
-    }));
     let channelOptions = [];
     try {
       const chanRes = await client.conversations.list({ types: 'public_channel,private_channel', limit: 200, exclude_archived: true });
       const botChannels = (chanRes.channels || []).filter(c => c.is_member);
-      channelOptions = botChannels.slice(0, 20).map(c => ({
+      channelOptions = botChannels.slice(0, 50).map(c => ({
         text: { type: 'plain_text', text: `#${c.name}`, emoji: true },
         value: `channel:${c.id}:${c.name}`,
       }));
     } catch (e) {
       logger.warn('Could not fetch channels:', e.message);
     }
-    const allOptions = [...ugOptions.slice(0, 60), ...customOptions.slice(0, 20), ...channelOptions.slice(0, 19)];
+    // Slack multi_static_select hard limit is 100 options total.
+    // Priority: ALL Slack usergroups first (no cap), then channels fill remaining slots.
+    const remainingSlots = Math.max(0, 100 - ugOptions.length);
+    const allOptions = [...ugOptions, ...channelOptions.slice(0, remainingSlots)].slice(0, 100);
 
     // FIX: Store options in server-side cache, put only a short session ID in private_metadata.
     // Slack's private_metadata limit is 3000 chars — allOptions easily exceeds that.
@@ -1631,13 +1538,6 @@ async function resolvePulseAudience(client, audienceValues, individualUsers, sen
         targetRaw = audienceValue;
         const membersRes = await client.usergroups.users.list({ usergroup: ugId });
         userIds = userIds.concat(membersRes.users || []);
-      } else if (audienceValue.startsWith('custom:')) {
-        const [, groupId, gName] = audienceValue.split(':');
-        groupNameParts.push(gName);
-        targetType = 'custom';
-        targetRaw = audienceValue;
-        const group = await db.getGroup(groupId);
-        userIds = userIds.concat(group ? group.member_ids : []);
       } else if (audienceValue.startsWith('channel:')) {
         const [, channelId, chanName] = audienceValue.split(':');
         groupNameParts.push(`#${chanName}`);
@@ -1678,6 +1578,7 @@ async function resolvePulseAudience(client, audienceValues, individualUsers, sen
   console.log(`   Port: ${process.env.PORT || 3456}\n`);
   console.log(`   Commands available:`);
   console.log(`     /announce          - Send a tracked announcement`);
+  console.log(`     /radarping         - Alias for /announce`);
   console.log(`     /announce-status   - View read receipts`);
-  console.log(`     /groups            - Manage custom recipient groups\n`);
+  console.log(`     /radarpulse        - Send a pulse quiz\n`);
 })();
