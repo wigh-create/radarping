@@ -52,6 +52,46 @@ async function initSchema() {
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pulse_campaigns (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      sender_slack_id TEXT NOT NULL,
+      target_raw TEXT,
+      target_type TEXT,
+      resolved_users TEXT NOT NULL DEFAULT '[]',
+      questions TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
+      notion_campaign_page_id TEXT
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pulse_responses (
+      id TEXT PRIMARY KEY,
+      campaign_id TEXT NOT NULL,
+      slack_user_id TEXT NOT NULL,
+      slack_display_name TEXT,
+      answers TEXT NOT NULL DEFAULT '[]',
+      started_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
+      completed_at INTEGER,
+      notion_row_id TEXT
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pulse_state (
+      id TEXT PRIMARY KEY,
+      campaign_id TEXT NOT NULL,
+      slack_user_id TEXT NOT NULL,
+      current_question_index INTEGER NOT NULL DEFAULT 0,
+      dm_ts TEXT,
+      dm_channel TEXT,
+      created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
+      UNIQUE(campaign_id, slack_user_id)
+    )
+  `);
 }
 
 initSchema().catch(err => console.error('DB schema init error:', err));
@@ -194,6 +234,128 @@ async function deleteGroup(id) {
 }
 
 // ============================================================
+//  Pulse Campaigns
+// ============================================================
+
+async function createPulseCampaign({ id, title, sender_slack_id, target_raw, target_type, resolved_users, questions }) {
+  await pool.query(
+    `INSERT INTO pulse_campaigns (id, title, sender_slack_id, target_raw, target_type, resolved_users, questions)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, title, sender_slack_id, target_raw || '', target_type || 'manual', JSON.stringify(resolved_users || []), JSON.stringify(questions || [])]
+  );
+}
+
+async function getPulseCampaign(id) {
+  const { rows } = await pool.query(`SELECT * FROM pulse_campaigns WHERE id = $1`, [id]);
+  if (!rows[0]) return null;
+  return {
+    ...rows[0],
+    resolved_users: JSON.parse(rows[0].resolved_users),
+    questions: JSON.parse(rows[0].questions),
+  };
+}
+
+async function updatePulseCampaignNotionId(id, notionPageId) {
+  await pool.query(
+    `UPDATE pulse_campaigns SET notion_campaign_page_id = $1 WHERE id = $2`,
+    [notionPageId, id]
+  );
+}
+
+// ============================================================
+//  Pulse Responses
+// ============================================================
+
+async function createPulseResponse({ id, campaign_id, slack_user_id, slack_display_name }) {
+  await pool.query(
+    `INSERT INTO pulse_responses (id, campaign_id, slack_user_id, slack_display_name)
+     VALUES ($1, $2, $3, $4)`,
+    [id, campaign_id, slack_user_id, slack_display_name || '']
+  );
+}
+
+async function getPulseResponse(id) {
+  const { rows } = await pool.query(`SELECT * FROM pulse_responses WHERE id = $1`, [id]);
+  if (!rows[0]) return null;
+  return { ...rows[0], answers: JSON.parse(rows[0].answers) };
+}
+
+async function updatePulseResponseAnswers(id, answers) {
+  await pool.query(
+    `UPDATE pulse_responses SET answers = $1 WHERE id = $2`,
+    [JSON.stringify(answers), id]
+  );
+}
+
+async function completePulseResponse(id) {
+  await pool.query(
+    `UPDATE pulse_responses SET completed_at = EXTRACT(EPOCH FROM NOW())::INTEGER WHERE id = $1`,
+    [id]
+  );
+}
+
+async function updatePulseResponseNotionId(id, notionRowId) {
+  await pool.query(
+    `UPDATE pulse_responses SET notion_row_id = $1 WHERE id = $2`,
+    [notionRowId, id]
+  );
+}
+
+async function getPulseResponseByUser(campaign_id, slack_user_id) {
+  const { rows } = await pool.query(
+    `SELECT * FROM pulse_responses WHERE campaign_id = $1 AND slack_user_id = $2 ORDER BY started_at DESC LIMIT 1`,
+    [campaign_id, slack_user_id]
+  );
+  if (!rows[0]) return null;
+  return { ...rows[0], answers: JSON.parse(rows[0].answers) };
+}
+
+async function countCompletedPulseResponses(campaign_id) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS count FROM pulse_responses WHERE campaign_id = $1 AND completed_at IS NOT NULL`,
+    [campaign_id]
+  );
+  return { rows };
+}
+
+// ============================================================
+//  Pulse State
+// ============================================================
+
+async function createPulseState({ id, campaign_id, slack_user_id, dm_ts, dm_channel }) {
+  await pool.query(
+    `INSERT INTO pulse_state (id, campaign_id, slack_user_id, dm_ts, dm_channel)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (campaign_id, slack_user_id) DO UPDATE
+       SET dm_ts = $4, dm_channel = $5, current_question_index = 0`,
+    [id, campaign_id, slack_user_id, dm_ts || null, dm_channel || null]
+  );
+}
+
+async function getPulseState(campaign_id, slack_user_id) {
+  const { rows } = await pool.query(
+    `SELECT * FROM pulse_state WHERE campaign_id = $1 AND slack_user_id = $2`,
+    [campaign_id, slack_user_id]
+  );
+  return rows[0] || null;
+}
+
+async function updatePulseStateQuestion(campaign_id, slack_user_id, question_index) {
+  await pool.query(
+    `UPDATE pulse_state SET current_question_index = $1
+     WHERE campaign_id = $2 AND slack_user_id = $3`,
+    [question_index, campaign_id, slack_user_id]
+  );
+}
+
+async function deletePulseState(campaign_id, slack_user_id) {
+  await pool.query(
+    `DELETE FROM pulse_state WHERE campaign_id = $1 AND slack_user_id = $2`,
+    [campaign_id, slack_user_id]
+  );
+}
+
+// ============================================================
 //  Exports
 // ============================================================
 
@@ -213,4 +375,19 @@ module.exports = {
   getGroups,
   getGroup,
   deleteGroup,
+  // Pulse
+  createPulseCampaign,
+  getPulseCampaign,
+  updatePulseCampaignNotionId,
+  createPulseResponse,
+  getPulseResponse,
+  getPulseResponseByUser,
+  updatePulseResponseAnswers,
+  completePulseResponse,
+  updatePulseResponseNotionId,
+  countCompletedPulseResponses,
+  createPulseState,
+  getPulseState,
+  updatePulseStateQuestion,
+  deletePulseState,
 };

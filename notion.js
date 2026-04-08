@@ -5,6 +5,8 @@
 
 const DATABASE_ID = process.env.NOTION_DATABASE_ID;         // Announcement Tracker
 const RECEIPTS_DATABASE_ID = '0a61c5da2338408e866e2479060bc0f6'; // Read Receipts
+const PULSE_CAMPAIGNS_DB_ID = process.env.NOTION_PULSE_CAMPAIGNS_DB_ID || 'e729537b2b2c4d2fa68d18af614b8d54';
+const PULSE_RESPONSES_DB_ID = process.env.NOTION_PULSE_RESPONSES_DB_ID || '13541ab001f94801a799b04de1972337';
 const API_KEY = process.env.NOTION_API_KEY;
 
 if (!API_KEY || API_KEY === 'secret_your-key-here') {
@@ -187,4 +189,111 @@ async function findPageByAnnouncementId(announcementId) {
   }
 }
 
-module.exports = { createAnnouncementPage, createRecipientRows, markRecipientRead, updateReadStats, ENABLED };
+// ============================================================
+//  Pulse Campaigns DB
+// ============================================================
+
+// Create a row in the Pulse Campaigns Notion DB when a pulse is sent
+// Returns the Notion page ID
+async function createPulseCampaignRow({ campaignId, title, senderName, targetRaw, totalRecipients, sentAt, questionsJson }) {
+  if (!ENABLED) return null;
+
+  try {
+    const result = await notionFetch('/pages', 'POST', {
+      parent: { database_id: PULSE_CAMPAIGNS_DB_ID },
+      properties: {
+        'Title': { title: [{ text: { content: title || 'Untitled Pulse' } }] },
+        'Campaign ID': { rich_text: [{ text: { content: campaignId } }] },
+        'Sent By': { rich_text: [{ text: { content: senderName || 'Unknown' } }] },
+        'Audience': { rich_text: [{ text: { content: targetRaw || '' } }] },
+        'Total Recipients': { number: totalRecipients || 0 },
+        'Respondent Count': { number: 0 },
+        'Sent At': { date: { start: sentAt || new Date().toISOString() } },
+        'Questions': { rich_text: [{ text: { content: (questionsJson || '').slice(0, 2000) } }] },
+      },
+    });
+
+    console.log(`✅ Notion: created pulse campaign row for ${campaignId.slice(0, 8)}`);
+    return result.id;
+  } catch (err) {
+    console.warn(`⚠️  Notion sync failed (create pulse campaign): ${err.message}`);
+    return null;
+  }
+}
+
+// Create a row in the Pulse Responses Notion DB when a respondent starts answering
+// Returns the Notion page ID
+async function createPulseResponseRow({ campaignId, respondentName, slackId, respondedAt }) {
+  if (!ENABLED) return null;
+
+  try {
+    const result = await notionFetch('/pages', 'POST', {
+      parent: { database_id: PULSE_RESPONSES_DB_ID },
+      properties: {
+        'Name': { title: [{ text: { content: respondentName || slackId || 'Unknown' } }] },
+        'Campaign ID': { rich_text: [{ text: { content: campaignId } }] },
+        'Slack ID': { rich_text: [{ text: { content: slackId || '' } }] },
+        'Responded At': { date: { start: respondedAt || new Date().toISOString() } },
+      },
+    });
+
+    console.log(`✅ Notion: created pulse response row for ${slackId}`);
+    return result.id;
+  } catch (err) {
+    console.warn(`⚠️  Notion sync failed (create pulse response): ${err.message}`);
+    return null;
+  }
+}
+
+// Update Q1–Q5 answer columns on a Pulse Response row
+// answers: [{ question_text, response_type, answer, score }]
+async function updatePulseResponseAnswers({ responsePageId, answers }) {
+  if (!ENABLED || !responsePageId) return;
+
+  try {
+    const props = {};
+    answers.forEach((a, i) => {
+      const qNum = i + 1;
+      if (qNum > 5) return; // Notion columns only go to Q5
+      const label = `Q${qNum}`;
+      const answerText = a.answer != null ? String(a.answer) : '';
+      props[label] = { rich_text: [{ text: { content: answerText.slice(0, 2000) } }] };
+      if (a.score != null) {
+        props[`${label} Score`] = { number: a.score };
+      }
+    });
+
+    await notionFetch(`/pages/${responsePageId}`, 'PATCH', { properties: props });
+    console.log(`✅ Notion: updated pulse response answers on ${responsePageId.slice(0, 8)}`);
+  } catch (err) {
+    console.warn(`⚠️  Notion sync failed (update pulse response answers): ${err.message}`);
+  }
+}
+
+// Increment the respondent count on a Pulse Campaign row
+async function updatePulseCampaignRespondentCount({ campaignPageId, respondentCount }) {
+  if (!ENABLED || !campaignPageId) return;
+
+  try {
+    await notionFetch(`/pages/${campaignPageId}`, 'PATCH', {
+      properties: {
+        'Respondent Count': { number: respondentCount },
+      },
+    });
+    console.log(`✅ Notion: updated pulse campaign respondent count to ${respondentCount}`);
+  } catch (err) {
+    console.warn(`⚠️  Notion sync failed (update pulse campaign respondent count): ${err.message}`);
+  }
+}
+
+module.exports = {
+  createAnnouncementPage,
+  createRecipientRows,
+  markRecipientRead,
+  updateReadStats,
+  ENABLED,
+  createPulseCampaignRow,
+  createPulseResponseRow,
+  updatePulseResponseAnswers,
+  updatePulseCampaignRespondentCount,
+};

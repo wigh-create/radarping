@@ -869,6 +869,698 @@ function buildProgressBar(pct) {
 }
 
 // ============================================================
+//  /radarpulse - Pulse quiz / check-in builder
+// ============================================================
+
+app.command('/radarpulse', async ({ ack, body, client, logger }) => {
+  await ack();
+  await openPulseModal({ client, triggerId: body.trigger_id, logger });
+});
+
+async function openPulseModal({ client, triggerId, logger }) {
+  try {
+    let ugOptions = [];
+    try {
+      const ugRes = await client.usergroups.list({ include_disabled: false });
+      ugOptions = (ugRes.usergroups || []).map(ug => ({
+        text: { type: 'plain_text', text: `${ug.name} (${ug.handle})`, emoji: true },
+        value: `slack_ug:${ug.id}:${ug.name}`,
+      }));
+    } catch (e) {
+      logger.warn('Could not fetch Slack usergroups:', e.message);
+    }
+
+    const customGroups = await db.getGroups();
+    const customOptions = customGroups.map(g => ({
+      text: { type: 'plain_text', text: `📋 ${g.name} (custom, ${g.member_ids.length} members)`, emoji: true },
+      value: `custom:${g.id}:${g.name}`,
+    }));
+
+    let channelOptions = [];
+    try {
+      const chanRes = await client.conversations.list({ types: 'public_channel,private_channel', limit: 200, exclude_archived: true });
+      const botChannels = (chanRes.channels || []).filter(c => c.is_member);
+      channelOptions = botChannels.slice(0, 20).map(c => ({
+        text: { type: 'plain_text', text: `#${c.name}`, emoji: true },
+        value: `channel:${c.id}:${c.name}`,
+      }));
+    } catch (e) {
+      logger.warn('Could not fetch channels:', e.message);
+    }
+
+    const allOptions = [...ugOptions.slice(0, 60), ...customOptions.slice(0, 20), ...channelOptions.slice(0, 19)];
+
+    await client.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: 'modal',
+        callback_id: 'pulse_modal_submit',
+        title: { type: 'plain_text', text: '📊 Send Pulse', emoji: true },
+        submit: { type: 'plain_text', text: 'Send Pulse →', emoji: true },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: buildPulseModalBlocks(allOptions),
+      },
+    });
+  } catch (error) {
+    logger.error('Error opening pulse modal:', error);
+  }
+}
+
+function buildPulseModalBlocks(allOptions) {
+  const blocks = [
+    {
+      type: 'input',
+      block_id: 'pulse_title_block',
+      element: {
+        type: 'plain_text_input',
+        action_id: 'pulse_title_input',
+        placeholder: { type: 'plain_text', text: 'e.g. Q1 Team Health Check, Sprint Retro Pulse...' },
+        max_length: 80,
+      },
+      label: { type: 'plain_text', text: '📌 Pulse Title', emoji: true },
+    },
+  ];
+
+  if (allOptions.length > 0) {
+    blocks.push({
+      type: 'input',
+      block_id: 'pulse_audience_block',
+      optional: true,
+      element: {
+        type: 'multi_static_select',
+        action_id: 'pulse_audience_select',
+        placeholder: { type: 'plain_text', text: 'Choose groups or channels...' },
+        options: allOptions,
+      },
+      label: { type: 'plain_text', text: '👥 Send to', emoji: true },
+      hint: { type: 'plain_text', text: 'Select one or more groups/channels, or add individuals below' },
+    });
+  }
+
+  blocks.push({
+    type: 'input',
+    block_id: 'pulse_individuals_block',
+    optional: true,
+    element: {
+      type: 'multi_users_select',
+      action_id: 'pulse_individuals_input',
+      placeholder: { type: 'plain_text', text: 'Add specific people (optional)' },
+    },
+    label: { type: 'plain_text', text: '🙋 Also send to individuals', emoji: true },
+  });
+
+  blocks.push({ type: 'divider' });
+
+  // Question 1 (required)
+  blocks.push(...buildQuestionBlocks(1, true));
+
+  // Questions 2–5 (optional)
+  for (let i = 2; i <= 5; i++) {
+    blocks.push(...buildQuestionBlocks(i, false));
+  }
+
+  return blocks;
+}
+
+function buildQuestionBlocks(num, required) {
+  const label = required ? `Question ${num}` : `Question ${num} (optional)`;
+  return [
+    {
+      type: 'input',
+      block_id: `pulse_q${num}_text_block`,
+      optional: !required,
+      element: {
+        type: 'plain_text_input',
+        action_id: `pulse_q${num}_text_input`,
+        placeholder: { type: 'plain_text', text: 'e.g. How energised do you feel this week?' },
+        max_length: 300,
+      },
+      label: { type: 'plain_text', text: `❓ ${label}`, emoji: true },
+    },
+    {
+      type: 'input',
+      block_id: `pulse_q${num}_type_block`,
+      optional: !required,
+      element: {
+        type: 'static_select',
+        action_id: `pulse_q${num}_type_input`,
+        placeholder: { type: 'plain_text', text: 'Response type' },
+        options: [
+          { text: { type: 'plain_text', text: 'Scale 1–10', emoji: true }, value: 'scale_10' },
+          { text: { type: 'plain_text', text: 'Scale 1–5', emoji: true }, value: 'scale_5' },
+          { text: { type: 'plain_text', text: 'Free text', emoji: true }, value: 'free_text' },
+        ],
+        initial_option: { text: { type: 'plain_text', text: 'Scale 1–10', emoji: true }, value: 'scale_10' },
+      },
+      label: { type: 'plain_text', text: '📏 Response type', emoji: true },
+    },
+    {
+      type: 'input',
+      block_id: `pulse_q${num}_low_block`,
+      optional: true,
+      element: {
+        type: 'plain_text_input',
+        action_id: `pulse_q${num}_low_input`,
+        placeholder: { type: 'plain_text', text: 'e.g. Not at all' },
+        max_length: 50,
+      },
+      label: { type: 'plain_text', text: `↙️ Low label (scale only, optional)`, emoji: true },
+    },
+    {
+      type: 'input',
+      block_id: `pulse_q${num}_high_block`,
+      optional: true,
+      element: {
+        type: 'plain_text_input',
+        action_id: `pulse_q${num}_high_input`,
+        placeholder: { type: 'plain_text', text: 'e.g. Extremely' },
+        max_length: 50,
+      },
+      label: { type: 'plain_text', text: `↗️ High label (scale only, optional)`, emoji: true },
+    },
+  ];
+}
+
+// ============================================================
+//  Pulse modal submission
+// ============================================================
+
+app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
+  await ack();
+
+  const senderId = body.user.id;
+  const senderName = body.user.name;
+  const values = view.state.values;
+
+  const title = values.pulse_title_block.pulse_title_input.value;
+  const audienceValues = values.pulse_audience_block?.pulse_audience_select?.selected_options?.map(o => o.value) || [];
+  const individualUsers = values.pulse_individuals_block?.pulse_individuals_input?.selected_users || [];
+
+  // Parse questions (1–5)
+  const questions = [];
+  for (let i = 1; i <= 5; i++) {
+    const text = values[`pulse_q${i}_text_block`]?.[`pulse_q${i}_text_input`]?.value;
+    const responseType = values[`pulse_q${i}_type_block`]?.[`pulse_q${i}_type_input`]?.selected_option?.value;
+    const lowLabel = values[`pulse_q${i}_low_block`]?.[`pulse_q${i}_low_input`]?.value || null;
+    const highLabel = values[`pulse_q${i}_high_block`]?.[`pulse_q${i}_high_input`]?.value || null;
+    if (text && responseType) {
+      questions.push({ index: questions.length, text, response_type: responseType, low_label: lowLabel, high_label: highLabel });
+    }
+  }
+
+  if (questions.length === 0) {
+    await client.chat.postMessage({
+      channel: senderId,
+      text: '❌ Please add at least one question to your pulse.',
+    });
+    return;
+  }
+
+  const hasAudience = audienceValues.length > 0 || individualUsers.length > 0;
+  if (!hasAudience) {
+    await client.chat.postMessage({
+      channel: senderId,
+      text: '❌ No audience selected. Pick a group or add individuals.',
+    });
+    return;
+  }
+
+  // Resolve audience
+  const { userIds, groupName, targetType, targetRaw } = await resolvePulseAudience(client, audienceValues, individualUsers, senderId, logger);
+
+  if (userIds.length === 0) {
+    await client.chat.postMessage({
+      channel: senderId,
+      text: `❌ Couldn't resolve any recipients. Check the group has members or add individuals.`,
+    });
+    return;
+  }
+
+  // Fetch sender display name
+  let senderDisplayName = senderName;
+  try {
+    const senderInfo = await client.users.info({ user: senderId });
+    senderDisplayName = senderInfo.user?.profile?.real_name || senderInfo.user?.profile?.display_name || senderName;
+  } catch {}
+
+  // Resolve recipient user info (filter bots/deactivated/sender)
+  const recipientUsers = [];
+  for (const uid of userIds) {
+    try {
+      const info = await client.users.info({ user: uid });
+      const u = info.user;
+      if (u.is_bot || u.deleted || u.id === senderId) continue;
+      recipientUsers.push({
+        user_id: u.id,
+        display_name: u.profile?.real_name || u.profile?.display_name || u.name,
+      });
+    } catch {
+      recipientUsers.push({ user_id: uid, display_name: uid });
+    }
+  }
+
+  if (recipientUsers.length === 0) {
+    await client.chat.postMessage({
+      channel: senderId,
+      text: `❌ No valid recipients found after filtering bots and inactive users.`,
+    });
+    return;
+  }
+
+  const campaignId = randomUUID();
+  const sentAt = new Date().toISOString();
+
+  // Save campaign to Postgres
+  await db.createPulseCampaign({
+    id: campaignId,
+    title,
+    sender_slack_id: senderId,
+    target_raw: targetRaw,
+    target_type: targetType,
+    resolved_users: recipientUsers.map(u => u.user_id),
+    questions,
+  });
+
+  // Sync to Notion (non-blocking)
+  notion.createPulseCampaignRow({
+    campaignId,
+    title,
+    senderName: senderDisplayName,
+    targetRaw,
+    totalRecipients: recipientUsers.length,
+    sentAt,
+    questionsJson: JSON.stringify(questions.map(q => q.text)),
+  }).then(pageId => {
+    if (pageId) db.updatePulseCampaignNotionId(campaignId, pageId);
+  }).catch(err => logger.warn('Notion pulse campaign sync failed:', err.message));
+
+  // Send DM to each recipient with first question
+  let sent = 0;
+  for (const recipient of recipientUsers) {
+    try {
+      const responseId = randomUUID();
+      await db.createPulseResponse({
+        id: responseId,
+        campaign_id: campaignId,
+        slack_user_id: recipient.user_id,
+        slack_display_name: recipient.display_name,
+      });
+
+      const dmBlocks = buildPulseDMBlocks({ id: campaignId, title, questions }, 0, null);
+      const dmResult = await client.chat.postMessage({
+        channel: recipient.user_id,
+        text: `📊 ${title} — pulse check-in from <@${senderId}>`,
+        blocks: dmBlocks,
+      });
+
+      if (dmResult?.ts) {
+        await db.createPulseState({
+          id: randomUUID(),
+          campaign_id: campaignId,
+          slack_user_id: recipient.user_id,
+          dm_ts: dmResult.ts,
+          dm_channel: dmResult.channel,
+        });
+      }
+
+      sent++;
+    } catch (err) {
+      logger.warn(`Could not DM pulse to ${recipient.user_id}:`, err.message);
+    }
+  }
+
+  // Confirm to sender
+  await client.chat.postMessage({
+    channel: senderId,
+    text: `✅ Pulse *"${title}"* sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.`,
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: '✅ Pulse Sent!', emoji: true },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*"${title}"* has been sent to *${sent}* recipient${sent !== 1 ? 's' : ''}.\n\n📋 *${questions.length} question${questions.length !== 1 ? 's' : ''}* · 👥 *${groupName}*\n\nResponses will be collected automatically as people answer.`,
+        },
+      },
+    ],
+  });
+});
+
+// ============================================================
+//  Pulse: scale button click (1-10 or 1-5)
+// ============================================================
+
+app.action('pulse_scale_button', async ({ ack, body, action, client, logger }) => {
+  await ack();
+
+  const userId = body.user.id;
+  // action.value format: "campaignId:questionIndex:score"
+  const [campaignId, questionIndexStr, scoreStr] = (action.value || '').split(':');
+  const questionIndex = parseInt(questionIndexStr, 10);
+  const score = parseInt(scoreStr, 10);
+
+  if (!campaignId || isNaN(questionIndex) || isNaN(score)) {
+    logger.warn('pulse_scale_button: invalid action value', action.value);
+    return;
+  }
+
+  await handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer: score, score, body });
+});
+
+// ============================================================
+//  Pulse: free text submit button click
+// ============================================================
+
+app.action('pulse_text_submit', async ({ ack, body, action, client, logger }) => {
+  await ack();
+
+  const userId = body.user.id;
+  // action.value format: "campaignId:questionIndex"
+  const [campaignId, questionIndexStr] = (action.value || '').split(':');
+  const questionIndex = parseInt(questionIndexStr, 10);
+
+  if (!campaignId || isNaN(questionIndex)) {
+    logger.warn('pulse_text_submit: invalid action value', action.value);
+    return;
+  }
+
+  // Extract the text input value from the block state
+  const blockId = `pulse_text_input_${questionIndex}`;
+  const textValue = body.state?.values?.[blockId]?.pulse_text_value?.value || '';
+
+  await handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer: textValue, score: null, body });
+});
+
+// ============================================================
+//  Shared pulse answer handler
+// ============================================================
+
+async function handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer, score, body }) {
+  try {
+    const campaign = await db.getPulseCampaign(campaignId);
+    if (!campaign) {
+      logger.warn(`handlePulseAnswer: campaign ${campaignId} not found`);
+      return;
+    }
+
+    const state = await db.getPulseState(campaignId, userId);
+    if (!state) {
+      logger.warn(`handlePulseAnswer: no pulse state for ${userId} / ${campaignId}`);
+      return;
+    }
+
+    // Guard: ignore stale button clicks (already moved past this question)
+    if (questionIndex !== state.current_question_index) {
+      logger.warn(`handlePulseAnswer: stale click — expected q${state.current_question_index}, got q${questionIndex}`);
+      return;
+    }
+
+    const questions = campaign.questions;
+    const currentQuestion = questions[questionIndex];
+
+    // Fetch the in-progress response row for this user + campaign
+    const response = await db.getPulseResponseByUser(campaignId, userId);
+    if (!response) {
+      logger.warn(`handlePulseAnswer: no response row for ${userId} / ${campaignId}`);
+      return;
+    }
+
+    // Append this answer
+    const answers = Array.isArray(response.answers) ? response.answers : [];
+    answers[questionIndex] = {
+      question_index: questionIndex,
+      question_text: currentQuestion.text,
+      response_type: currentQuestion.response_type,
+      answer,
+      score: score != null ? score : null,
+    };
+    await db.updatePulseResponseAnswers(response.id, answers);
+
+    const nextIndex = questionIndex + 1;
+    const isComplete = nextIndex >= questions.length;
+
+    if (isComplete) {
+      // All questions answered — complete the response
+      await db.completePulseResponse(response.id);
+      await db.deletePulseState(campaignId, userId);
+
+      // Sync to Notion (non-blocking)
+      const respondedAt = new Date().toISOString();
+      notion.createPulseResponseRow({
+        campaignId,
+        respondentName: response.slack_display_name,
+        slackId: userId,
+        respondedAt,
+      }).then(async (responsePageId) => {
+        if (responsePageId) {
+          await db.updatePulseResponseNotionId(response.id, responsePageId);
+          await notion.updatePulseResponseAnswers({ responsePageId, answers });
+        }
+        // Update respondent count on campaign
+        if (campaign.notion_campaign_page_id) {
+          // Count completed responses
+          const { rows: completedRows } = await db.countCompletedPulseResponses(campaignId);
+          const count = completedRows?.[0]?.count ? parseInt(completedRows[0].count) : 1;
+          await notion.updatePulseCampaignRespondentCount({
+            campaignPageId: campaign.notion_campaign_page_id,
+            respondentCount: count,
+          });
+        }
+      }).catch(err => logger.warn('Notion pulse response sync failed:', err.message));
+
+      // Update DM with completion message
+      const completionBlocks = [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: '🎉 All done!', emoji: true },
+        },
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `Thanks for completing *"${campaign.title}"*! Your responses have been recorded. 🙏`,
+          },
+        },
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: `${buildPulseProgressBar(questions.length, questions.length)} ${questions.length}/${questions.length} questions answered` }],
+        },
+      ];
+
+      try {
+        await client.chat.update({
+          channel: state.dm_channel,
+          ts: state.dm_ts,
+          text: `🎉 Thanks for completing "${campaign.title}"!`,
+          blocks: completionBlocks,
+        });
+      } catch (err) {
+        logger.warn('Could not update pulse DM on completion:', err.message);
+      }
+
+    } else {
+      // Advance to next question
+      await db.updatePulseStateQuestion(campaignId, userId, nextIndex);
+
+      const nextBlocks = buildPulseDMBlocks(campaign, nextIndex, null);
+      try {
+        await client.chat.update({
+          channel: state.dm_channel,
+          ts: state.dm_ts,
+          text: `📊 ${campaign.title} — question ${nextIndex + 1} of ${questions.length}`,
+          blocks: nextBlocks,
+        });
+      } catch (err) {
+        logger.warn('Could not update pulse DM for next question:', err.message);
+      }
+    }
+  } catch (err) {
+    logger.error('handlePulseAnswer error:', err);
+  }
+}
+
+// ============================================================
+//  Pulse DM block builder
+// ============================================================
+
+function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
+  const questions = campaign.questions;
+  const question = questions[questionIndex];
+  const total = questions.length;
+  const progressBar = buildPulseProgressBar(questionIndex, total);
+
+  const blocks = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: `📊 ${campaign.title}`, emoji: true },
+    },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `${progressBar}  Question ${questionIndex + 1} of ${total}` }],
+    },
+    { type: 'divider' },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*${question.text}*` },
+    },
+  ];
+
+  if (question.response_type === 'scale_10') {
+    // Low/high labels
+    if (question.low_label || question.high_label) {
+      blocks.push({
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `${question.low_label ? `_${question.low_label}_ ←` : ''} ${question.high_label ? `→ _${question.high_label}_` : ''}`.trim(),
+        }],
+      });
+    }
+    // Two rows of buttons: 1-5 and 6-10
+    blocks.push({
+      type: 'actions',
+      elements: [1, 2, 3, 4, 5].map(n => ({
+        type: 'button',
+        text: { type: 'plain_text', text: String(n), emoji: true },
+        action_id: 'pulse_scale_button',
+        value: `${campaign.id}:${questionIndex}:${n}`,
+      })),
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [6, 7, 8, 9, 10].map(n => ({
+        type: 'button',
+        text: { type: 'plain_text', text: String(n), emoji: true },
+        action_id: 'pulse_scale_button',
+        value: `${campaign.id}:${questionIndex}:${n}`,
+      })),
+    });
+
+  } else if (question.response_type === 'scale_5') {
+    if (question.low_label || question.high_label) {
+      blocks.push({
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `${question.low_label ? `_${question.low_label}_ ←` : ''} ${question.high_label ? `→ _${question.high_label}_` : ''}`.trim(),
+        }],
+      });
+    }
+    blocks.push({
+      type: 'actions',
+      elements: [1, 2, 3, 4, 5].map(n => ({
+        type: 'button',
+        text: { type: 'plain_text', text: String(n), emoji: true },
+        action_id: 'pulse_scale_button',
+        value: `${campaign.id}:${questionIndex}:${n}`,
+      })),
+    });
+
+  } else {
+    // Free text
+    const blockId = `pulse_text_input_${questionIndex}`;
+    blocks.push({
+      type: 'input',
+      block_id: blockId,
+      optional: true,
+      dispatch_action: false,
+      element: {
+        type: 'plain_text_input',
+        action_id: 'pulse_text_value',
+        multiline: true,
+        placeholder: { type: 'plain_text', text: 'Type your answer here...' },
+      },
+      label: { type: 'plain_text', text: 'Your answer', emoji: true },
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [{
+        type: 'button',
+        text: { type: 'plain_text', text: 'Submit →', emoji: true },
+        action_id: 'pulse_text_submit',
+        value: `${campaign.id}:${questionIndex}`,
+        style: 'primary',
+      }],
+    });
+  }
+
+  return blocks;
+}
+
+function buildPulseProgressBar(current, total) {
+  if (total === 0) return '';
+  const filled = Math.min(current, total);
+  const empty = total - filled;
+  return '▓'.repeat(filled) + '░'.repeat(empty);
+}
+
+// ============================================================
+//  Pulse audience resolver
+// ============================================================
+
+async function resolvePulseAudience(client, audienceValues, individualUsers, senderId, logger) {
+  let userIds = [];
+  const groupNameParts = [];
+  let targetType = 'manual';
+  let targetRaw = '';
+
+  for (const audienceValue of audienceValues) {
+    try {
+      if (audienceValue.startsWith('slack_ug:')) {
+        const [, ugId, ugName] = audienceValue.split(':');
+        groupNameParts.push(ugName);
+        targetType = 'usergroup';
+        targetRaw = audienceValue;
+        const membersRes = await client.usergroups.users.list({ usergroup: ugId });
+        userIds = userIds.concat(membersRes.users || []);
+
+      } else if (audienceValue.startsWith('custom:')) {
+        const [, groupId, gName] = audienceValue.split(':');
+        groupNameParts.push(gName);
+        targetType = 'custom';
+        targetRaw = audienceValue;
+        const group = await db.getGroup(groupId);
+        userIds = userIds.concat(group ? group.member_ids : []);
+
+      } else if (audienceValue.startsWith('channel:')) {
+        const [, channelId, chanName] = audienceValue.split(':');
+        groupNameParts.push(`#${chanName}`);
+        targetType = 'channel';
+        targetRaw = audienceValue;
+        const membersRes = await client.conversations.members({ channel: channelId });
+        userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
+      }
+    } catch (err) {
+      logger.error('Error resolving pulse audience:', err);
+    }
+  }
+
+  if (individualUsers.length > 0) {
+    if (!targetRaw) targetRaw = 'individuals';
+    if (groupNameParts.length === 0) targetType = 'manual';
+  }
+
+  const allUserIds = [...new Set([...userIds, ...individualUsers])];
+
+  let groupName;
+  if (groupNameParts.length > 0) {
+    groupName = groupNameParts.join(' + ');
+    if (individualUsers.length > 0) {
+      groupName += ` + ${individualUsers.length} individual${individualUsers.length > 1 ? 's' : ''}`;
+    }
+  } else if (individualUsers.length > 0) {
+    groupName = `${individualUsers.length} individual${individualUsers.length > 1 ? 's' : ''}`;
+  } else {
+    groupName = 'Unknown Group';
+  }
+
+  return { userIds: allUserIds, groupName, targetType, targetRaw };
+}
+
+// ============================================================
 //  Start
 // ============================================================
 (async () => {
