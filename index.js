@@ -1385,6 +1385,7 @@ async function handlePulseAnswer({ client, logger, userId, campaignId, questionI
         respondentName: response.slack_display_name,
         slackId: userId,
         respondedAt,
+        pulseTitle: campaign.title,
       }).then(async (responsePageId) => {
         if (responsePageId) {
           await db.updatePulseResponseNotionId(response.id, responsePageId);
