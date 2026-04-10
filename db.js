@@ -5,13 +5,11 @@
  * DATABASE_URL is set automatically by Railway when you add a Postgres plugin.
  */
 const { Pool } = require('pg');
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   // Railway Postgres requires SSL in production; rejectUnauthorized: false handles self-signed certs
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
 });
-
 // ============================================================
 //  Schema bootstrap — runs on startup, safe to re-run
 // ============================================================
@@ -29,7 +27,6 @@ async function initSchema() {
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     )
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS recipients (
       id SERIAL PRIMARY KEY,
@@ -42,7 +39,6 @@ async function initSchema() {
       UNIQUE(announcement_id, user_id)
     )
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS groups (
       id TEXT PRIMARY KEY,
@@ -52,7 +48,6 @@ async function initSchema() {
       created_at INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
     )
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pulse_campaigns (
       id TEXT PRIMARY KEY,
@@ -68,14 +63,12 @@ async function initSchema() {
       channel_post_ts TEXT
     )
   `);
-
   // Migrate existing tables: add channel post columns if they don't exist yet
   await pool.query(`
     ALTER TABLE pulse_campaigns
       ADD COLUMN IF NOT EXISTS channel_post_channel TEXT,
       ADD COLUMN IF NOT EXISTS channel_post_ts TEXT
   `).catch(() => {});
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pulse_responses (
       id TEXT PRIMARY KEY,
@@ -88,7 +81,6 @@ async function initSchema() {
       notion_row_id TEXT
     )
   `);
-
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pulse_state (
       id TEXT PRIMARY KEY,
@@ -101,14 +93,29 @@ async function initSchema() {
       UNIQUE(campaign_id, slack_user_id)
     )
   `);
+  // ── Scheduled posts ──────────────────────────────────────────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS scheduled_posts (
+      id           SERIAL  PRIMARY KEY,
+      type         TEXT    NOT NULL,
+      created_by   TEXT    NOT NULL,
+      payload      JSONB   NOT NULL,
+      scheduled_at INTEGER NOT NULL,
+      status       TEXT    NOT NULL DEFAULT 'pending',
+      sent_at      INTEGER,
+      created_at   INTEGER DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_scheduled_posts_due
+      ON scheduled_posts (status, scheduled_at)
+      WHERE status = 'pending'
+  `);
 }
-
 initSchema().catch(err => console.error('DB schema init error:', err));
-
 // ============================================================
 //  Announcements
 // ============================================================
-
 async function createAnnouncement({ id, sender_id, sender_name, message, group_name, target_type, target_id }) {
   await pool.query(
     `INSERT INTO announcements (id, sender_id, sender_name, message, group_name, target_type, target_id)
@@ -116,14 +123,12 @@ async function createAnnouncement({ id, sender_id, sender_name, message, group_n
     [id, sender_id, sender_name, message, group_name, target_type, target_id]
   );
 }
-
 async function updateRecipientCount(id, count) {
   await pool.query(
     `UPDATE announcements SET total_recipients = $1 WHERE id = $2`,
     [count, id]
   );
 }
-
 async function getAnnouncement(id) {
   const { rows } = await pool.query(
     `SELECT * FROM announcements WHERE id = $1`,
@@ -131,7 +136,6 @@ async function getAnnouncement(id) {
   );
   return rows[0] || null;
 }
-
 async function getRecentAnnouncements(senderId, limit = 10) {
   const { rows } = await pool.query(
     `SELECT * FROM announcements WHERE sender_id = $1 ORDER BY created_at DESC LIMIT $2`,
@@ -139,11 +143,9 @@ async function getRecentAnnouncements(senderId, limit = 10) {
   );
   return rows;
 }
-
 // ============================================================
 //  Recipients
 // ============================================================
-
 async function addRecipients(announcementId, users) {
   // users: [{ user_id, user_name }]
   for (const u of users) {
@@ -155,7 +157,6 @@ async function addRecipients(announcementId, users) {
     );
   }
 }
-
 async function storeDmTs(announcementId, userId, dmTs, dmChannel) {
   await pool.query(
     `UPDATE recipients SET dm_ts = $1, dm_channel = $2
@@ -163,7 +164,6 @@ async function storeDmTs(announcementId, userId, dmTs, dmChannel) {
     [dmTs, dmChannel, announcementId, userId]
   );
 }
-
 async function getRecipient(announcementId, userId) {
   const { rows } = await pool.query(
     `SELECT * FROM recipients WHERE announcement_id = $1 AND user_id = $2`,
@@ -171,7 +171,6 @@ async function getRecipient(announcementId, userId) {
   );
   return rows[0] || null;
 }
-
 async function markRead(announcementId, userId) {
   await pool.query(
     `UPDATE recipients
@@ -180,7 +179,6 @@ async function markRead(announcementId, userId) {
     [announcementId, userId]
   );
 }
-
 async function getRecipientStats(announcementId) {
   const { rows } = await pool.query(
     `SELECT
@@ -195,7 +193,6 @@ async function getRecipientStats(announcementId) {
     read_count: parseInt(row.read_count) || 0,
   };
 }
-
 async function getPendingReaders(announcementId) {
   const { rows } = await pool.query(
     `SELECT user_id, user_name FROM recipients
@@ -204,7 +201,6 @@ async function getPendingReaders(announcementId) {
   );
   return rows;
 }
-
 async function getAllReaders(announcementId) {
   const { rows } = await pool.query(
     `SELECT user_id, user_name, read_at FROM recipients
@@ -213,11 +209,9 @@ async function getAllReaders(announcementId) {
   );
   return rows;
 }
-
 // ============================================================
 //  Custom Groups
 // ============================================================
-
 async function saveGroup({ id, name, member_ids, created_by }) {
   await pool.query(
     `INSERT INTO groups (id, name, member_ids, created_by)
@@ -226,26 +220,21 @@ async function saveGroup({ id, name, member_ids, created_by }) {
     [id, name, JSON.stringify(member_ids), created_by]
   );
 }
-
 async function getGroups() {
   const { rows } = await pool.query(`SELECT * FROM groups ORDER BY name`);
   return rows.map(r => ({ ...r, member_ids: JSON.parse(r.member_ids) }));
 }
-
 async function getGroup(id) {
   const { rows } = await pool.query(`SELECT * FROM groups WHERE id = $1`, [id]);
   if (!rows[0]) return null;
   return { ...rows[0], member_ids: JSON.parse(rows[0].member_ids) };
 }
-
 async function deleteGroup(id) {
   await pool.query(`DELETE FROM groups WHERE id = $1`, [id]);
 }
-
 // ============================================================
 //  Pulse Campaigns
 // ============================================================
-
 async function createPulseCampaign({ id, title, sender_slack_id, target_raw, target_type, resolved_users, questions }) {
   await pool.query(
     `INSERT INTO pulse_campaigns (id, title, sender_slack_id, target_raw, target_type, resolved_users, questions)
@@ -253,7 +242,6 @@ async function createPulseCampaign({ id, title, sender_slack_id, target_raw, tar
     [id, title, sender_slack_id, target_raw || '', target_type || 'manual', JSON.stringify(resolved_users || []), JSON.stringify(questions || [])]
   );
 }
-
 async function getPulseCampaign(id) {
   const { rows } = await pool.query(`SELECT * FROM pulse_campaigns WHERE id = $1`, [id]);
   if (!rows[0]) return null;
@@ -263,25 +251,21 @@ async function getPulseCampaign(id) {
     questions: JSON.parse(rows[0].questions),
   };
 }
-
 async function updatePulseCampaignNotionId(id, notionPageId) {
   await pool.query(
     `UPDATE pulse_campaigns SET notion_campaign_page_id = $1 WHERE id = $2`,
     [notionPageId, id]
   );
 }
-
 async function storePulseChannelPost(campaignId, channelId, ts) {
   await pool.query(
     `UPDATE pulse_campaigns SET channel_post_channel = $1, channel_post_ts = $2 WHERE id = $3`,
     [channelId, ts, campaignId]
   );
 }
-
 // ============================================================
 //  Pulse Responses
 // ============================================================
-
 async function createPulseResponse({ id, campaign_id, slack_user_id, slack_display_name }) {
   await pool.query(
     `INSERT INTO pulse_responses (id, campaign_id, slack_user_id, slack_display_name)
@@ -289,34 +273,29 @@ async function createPulseResponse({ id, campaign_id, slack_user_id, slack_displ
     [id, campaign_id, slack_user_id, slack_display_name || '']
   );
 }
-
 async function getPulseResponse(id) {
   const { rows } = await pool.query(`SELECT * FROM pulse_responses WHERE id = $1`, [id]);
   if (!rows[0]) return null;
   return { ...rows[0], answers: JSON.parse(rows[0].answers) };
 }
-
 async function updatePulseResponseAnswers(id, answers) {
   await pool.query(
     `UPDATE pulse_responses SET answers = $1 WHERE id = $2`,
     [JSON.stringify(answers), id]
   );
 }
-
 async function completePulseResponse(id) {
   await pool.query(
     `UPDATE pulse_responses SET completed_at = EXTRACT(EPOCH FROM NOW())::INTEGER WHERE id = $1`,
     [id]
   );
 }
-
 async function updatePulseResponseNotionId(id, notionRowId) {
   await pool.query(
     `UPDATE pulse_responses SET notion_row_id = $1 WHERE id = $2`,
     [notionRowId, id]
   );
 }
-
 async function getPulseResponseByUser(campaign_id, slack_user_id) {
   const { rows } = await pool.query(
     `SELECT * FROM pulse_responses WHERE campaign_id = $1 AND slack_user_id = $2 ORDER BY started_at DESC LIMIT 1`,
@@ -325,7 +304,6 @@ async function getPulseResponseByUser(campaign_id, slack_user_id) {
   if (!rows[0]) return null;
   return { ...rows[0], answers: JSON.parse(rows[0].answers) };
 }
-
 async function countCompletedPulseResponses(campaign_id) {
   const { rows } = await pool.query(
     `SELECT COUNT(*) AS count FROM pulse_responses WHERE campaign_id = $1 AND completed_at IS NOT NULL`,
@@ -333,11 +311,9 @@ async function countCompletedPulseResponses(campaign_id) {
   );
   return { rows };
 }
-
 // ============================================================
 //  Pulse State
 // ============================================================
-
 async function createPulseState({ id, campaign_id, slack_user_id, dm_ts, dm_channel }) {
   await pool.query(
     `INSERT INTO pulse_state (id, campaign_id, slack_user_id, dm_ts, dm_channel)
@@ -347,7 +323,6 @@ async function createPulseState({ id, campaign_id, slack_user_id, dm_ts, dm_chan
     [id, campaign_id, slack_user_id, dm_ts || null, dm_channel || null]
   );
 }
-
 async function getPulseState(campaign_id, slack_user_id) {
   const { rows } = await pool.query(
     `SELECT * FROM pulse_state WHERE campaign_id = $1 AND slack_user_id = $2`,
@@ -355,7 +330,6 @@ async function getPulseState(campaign_id, slack_user_id) {
   );
   return rows[0] || null;
 }
-
 async function updatePulseStateQuestion(campaign_id, slack_user_id, question_index) {
   await pool.query(
     `UPDATE pulse_state SET current_question_index = $1
@@ -363,18 +337,66 @@ async function updatePulseStateQuestion(campaign_id, slack_user_id, question_ind
     [question_index, campaign_id, slack_user_id]
   );
 }
-
 async function deletePulseState(campaign_id, slack_user_id) {
   await pool.query(
     `DELETE FROM pulse_state WHERE campaign_id = $1 AND slack_user_id = $2`,
     [campaign_id, slack_user_id]
   );
 }
+// ============================================================
+//  Scheduled Posts
+// ============================================================
+async function createScheduledPost({ type, created_by, payload, scheduled_at }) {
+  const res = await pool.query(
+    `INSERT INTO scheduled_posts (type, created_by, payload, scheduled_at)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id`,
+    [type, created_by, JSON.stringify(payload), scheduled_at]
+  );
+  return res.rows[0].id;
+}
 
+// Atomic claim — grabs all due posts in one UPDATE so concurrent workers can't double-send
+async function claimDuePosts() {
+  const now = Math.floor(Date.now() / 1000);
+  const res = await pool.query(
+    `UPDATE scheduled_posts
+     SET status = 'claimed'
+     WHERE status = 'pending'
+       AND scheduled_at <= $1
+     RETURNING *`,
+    [now]
+  );
+  return res.rows;
+}
+
+async function markPostSent({ id }) {
+  const now = Math.floor(Date.now() / 1000);
+  await pool.query(
+    `UPDATE scheduled_posts SET status = 'sent', sent_at = $1 WHERE id = $2`,
+    [now, id]
+  );
+}
+
+async function cancelScheduledPost({ id }) {
+  await pool.query(
+    `UPDATE scheduled_posts SET status = 'cancelled' WHERE id = $1 AND status = 'pending'`,
+    [id]
+  );
+}
+
+async function getScheduledPostsByUser({ user_id }) {
+  const res = await pool.query(
+    `SELECT * FROM scheduled_posts
+     WHERE created_by = $1
+     ORDER BY scheduled_at ASC`,
+    [user_id]
+  );
+  return res.rows;
+}
 // ============================================================
 //  Exports
 // ============================================================
-
 module.exports = {
   storeDmTs,
   getRecipient,
@@ -407,4 +429,10 @@ module.exports = {
   getPulseState,
   updatePulseStateQuestion,
   deletePulseState,
+  // Scheduled Posts
+  createScheduledPost,
+  claimDuePosts,
+  markPostSent,
+  cancelScheduledPost,
+  getScheduledPostsByUser,
 };
