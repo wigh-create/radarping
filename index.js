@@ -135,7 +135,7 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
           action_id: 'link_input',
           placeholder: { type: 'plain_text', text: 'https://...' },
         },
-        label: { type: 'plain_text', text: '🔗 Link (optional)', emoji: true },
+        label: { type: 'plain_text', text: '🔗 Link', emoji: true },
         hint: { type: 'plain_text', text: 'Attach a doc, page, or resource to your announcement' },
       },
       {
@@ -146,7 +146,7 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
           type: 'datetimepicker',
           action_id: 'schedule_at',
         },
-        label: { type: 'plain_text', text: '🕐 Schedule for later (optional)', emoji: true },
+        label: { type: 'plain_text', text: '🕐 Schedule for later', emoji: true },
       },
     ];
     await client.views.open({
@@ -647,7 +647,7 @@ function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Se
       type: 'datetimepicker',
       action_id: 'schedule_at',
     },
-    label: { type: 'plain_text', text: '🕐 Schedule for later (optional)', emoji: true },
+    label: { type: 'plain_text', text: '🕐 Schedule for later', emoji: true },
   });
   return blocks;
 }
