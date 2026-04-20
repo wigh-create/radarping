@@ -21,6 +21,26 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
   port: process.env.PORT || 3456,
 });
+
+async function listAllChannelMembers(client, channel, logger) {
+  const members = [];
+  let cursor;
+  for (let page = 0; page < 50; page++) {
+    const resp = await client.conversations.members({
+      channel,
+      limit: 200,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (!resp?.ok) {
+      throw new Error(resp?.error || 'Failed to list channel members');
+    }
+    if (Array.isArray(resp.members)) members.push(...resp.members);
+    cursor = resp.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+  if (cursor) logger?.warn?.('listAllChannelMembers: pagination limit reached, results may be truncated');
+  return [...new Set(members)].filter((id) => id && id !== 'USLACKBOT');
+}
 // ============================================================
 //  Shared: search Slack user groups (for multi_external_select)
 //  Only returns @-handle groups — no channels. Channels have
@@ -112,7 +132,24 @@ async function openAnnounceModal({ client, triggerId, prefillMessage = '', logge
           filter: { include: ['public', 'private'] },
         },
         label: { type: 'plain_text', text: '📢 Send to channels', emoji: true },
-        hint: { type: 'plain_text', text: 'Posts visibly in the channel AND DMs all members for read receipts' },
+        hint: { type: 'plain_text', text: 'Posts visibly in the channel. Optionally DM & track all channel members (toggle below).' },
+      },
+      {
+        type: 'input',
+        block_id: 'channel_tracking_block',
+        optional: true,
+        element: {
+          type: 'checkboxes',
+          action_id: 'channel_tracking_checkbox',
+          options: [
+            {
+              text: { type: 'plain_text', text: 'DM & track everyone in selected channels', emoji: true },
+              value: 'include_channel_members',
+            },
+          ],
+        },
+        label: { type: 'plain_text', text: 'Channel tracking', emoji: true },
+        hint: { type: 'plain_text', text: 'If unchecked: message posts in channel(s), but only selected groups/people get DMs and tracking.' },
       },
       {
         type: 'input',
@@ -207,6 +244,10 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   if (linkUrl && !linkUrl.match(/^https?:\/\//i)) {
     linkUrl = `https://${linkUrl}`;
   }
+  const includeChannelMembers =
+    (values.channel_tracking_block?.channel_tracking_checkbox?.selected_options || []).some(
+      (o) => o.value === 'include_channel_members'
+    );
 
   // ── SCHEDULE FORK ──────────────────────────────────────────────────────────
   const scheduleAt = values?.schedule_block?.schedule_at?.selected_date_time;
@@ -220,34 +261,23 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       await client.chat.postMessage({ channel: senderId, text: '❌ No audience selected. Pick a group, channel, or add individuals.' });
       return;
     }
-
-    let userIds = [];
-    for (const gv of groupValues) {
-      try {
-        if (gv.startsWith('slack_ug:')) {
-          const [, ugId] = gv.split(':');
-          const membersRes = await client.usergroups.users.list({ usergroup: ugId });
-          userIds = userIds.concat(membersRes.users || []);
-        }
-      } catch (err) { logger.error('Error resolving announce user group for schedule:', err); }
-    }
-    for (const channelId of selectedChannels) {
-      try {
-        const membersRes = await client.conversations.members({ channel: channelId });
-        userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
-      } catch (err) { logger.error('Error resolving announce channel for schedule:', err); }
-    }
-
-    const recipients = [...new Set([...userIds, ...individualUsers])];
-    if (recipients.length === 0) {
-      await client.chat.postMessage({ channel: senderId, text: '❌ Couldn\'t resolve any recipients.' });
-      return;
-    }
+    const usergroupIds = groupValues
+      .filter((gv) => gv.startsWith('slack_ug:'))
+      .map((gv) => gv.split(':')[1])
+      .filter(Boolean);
 
     await createScheduledPost({
       type: 'announce',
       created_by: senderId,
-      payload: { title, message, link: linkUrl, recipients },
+      payload: {
+        title,
+        message,
+        link: linkUrl,
+        channels: selectedChannels,
+        includeChannelMembers,
+        usergroupIds,
+        individualUsers,
+      },
       scheduled_at: scheduleAt,
     });
 
@@ -258,7 +288,7 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `✅ *Announcement scheduled!*\n📣 *"${message.slice(0, 100)}${message.length > 100 ? '...' : ''}"*\n\n⏰ Will be sent to *${recipients.length}* recipient${recipients.length !== 1 ? 's' : ''} at the scheduled time.`,
+          text: `✅ *Announcement scheduled!*\n📣 *"${message.slice(0, 100)}${message.length > 100 ? '...' : ''}"*\n\n⏰ Will be sent at the scheduled time.${selectedChannels.length ? `\n📢 Will post in *${selectedChannels.length}* channel${selectedChannels.length !== 1 ? 's' : ''}.` : ''}${includeChannelMembers ? `\n👥 Will DM & track all channel members.` : ''}`,
         },
       }],
     });
@@ -302,8 +332,10 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       channelPostTargets.push({ id: channelId, name: chanName });
       targetType = 'channel';
       targetId = channelId;
-      const membersRes = await client.conversations.members({ channel: channelId });
-      userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
+      if (includeChannelMembers) {
+        const members = await listAllChannelMembers(client, channelId, logger);
+        userIds = userIds.concat(members.filter((id) => id !== senderId));
+      }
     } catch (err) { logger.error('Error resolving channel:', err); }
   }
   if (individualUsers.length > 0) {
@@ -376,7 +408,13 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   }];
   if (channelPostTargets.length > 0) {
     const channelList = channelPostTargets.map(c => `#${c.name}`).join(', ');
-    confirmBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: `📢 Also posted visibly in ${channelList}. All channel members are being tracked for read receipts.` } });
+    confirmBlocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `📢 Also posted visibly in ${channelList}.${includeChannelMembers ? ' All channel members are being tracked for read receipts.' : ' Only selected groups/people are being tracked (channel viewers can still click to mark read).'}`
+      }
+    });
   }
   confirmBlocks.push(
     { type: 'section', text: { type: 'mrkdwn', text: `Track read receipts with:\n\`/announce-status ${announcementId.slice(0, 8)}\`` } },
@@ -616,7 +654,24 @@ function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Se
       optional: true,
       element: { type: 'multi_conversations_select', action_id: 'pulse_channel_select', placeholder: { type: 'plain_text', text: 'Pick channels...' }, filter: { include: ['public', 'private'] } },
       label: { type: 'plain_text', text: '📢 Send to channels', emoji: true },
-      hint: { type: 'plain_text', text: 'Posts the pulse in the channel AND DMs all members' },
+      hint: { type: 'plain_text', text: 'Posts the pulse in the channel. Optionally DM everyone in the channel (toggle below).' },
+    },
+    {
+      type: 'input',
+      block_id: 'pulse_channel_tracking_block',
+      optional: true,
+      element: {
+        type: 'checkboxes',
+        action_id: 'pulse_channel_tracking_checkbox',
+        options: [
+          {
+            text: { type: 'plain_text', text: 'DM everyone in selected channels', emoji: true },
+            value: 'include_channel_members',
+          },
+        ],
+      },
+      label: { type: 'plain_text', text: 'Channel audience expansion', emoji: true },
+      hint: { type: 'plain_text', text: 'If unchecked: pulse posts in channel(s), but only selected groups/people get the DM.' },
     },
     {
       type: 'input',
@@ -753,6 +808,10 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   const senderName = body.user.name;
   const values = view.state.values;
   const title = values.pulse_title_block.pulse_title_input.value;
+  const includePulseChannelMembers =
+    (values.pulse_channel_tracking_block?.pulse_channel_tracking_checkbox?.selected_options || []).some(
+      (o) => o.value === 'include_channel_members'
+    );
 
   // ── SCHEDULE FORK ──────────────────────────────────────────────────────────
   const scheduleAt = values?.schedule_block?.schedule_at?.selected_date_time;
@@ -772,38 +831,30 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
     const individualUsers = values.pulse_individuals_block?.pulse_individuals_input?.selected_users || [];
     const hasAudience = groupValues.length > 0 || selectedChannels.length > 0 || individualUsers.length > 0;
     if (!hasAudience) { await client.chat.postMessage({ channel: senderId, text: '❌ No audience selected. Pick a group, channel, or add individuals.' }); return; }
-
-    let userIds = [];
-    for (const gv of groupValues) {
-      try {
-        if (gv.startsWith('slack_ug:')) {
-          const [, ugId] = gv.split(':');
-          const membersRes = await client.usergroups.users.list({ usergroup: ugId });
-          userIds = userIds.concat(membersRes.users || []);
-        }
-      } catch (err) { logger.error('Error resolving pulse user group for schedule:', err); }
-    }
-    for (const channelId of selectedChannels) {
-      try {
-        const membersRes = await client.conversations.members({ channel: channelId });
-        userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
-      } catch (err) { logger.error('Error resolving pulse channel for schedule:', err); }
-    }
-
-    const recipients = [...new Set([...userIds, ...individualUsers])];
-    if (recipients.length === 0) { await client.chat.postMessage({ channel: senderId, text: '❌ Couldn\'t resolve any recipients.' }); return; }
+    const usergroupIds = groupValues
+      .filter((gv) => gv.startsWith('slack_ug:'))
+      .map((gv) => gv.split(':')[1])
+      .filter(Boolean);
 
     await createScheduledPost({
       type: 'pulse',
       created_by: senderId,
-      payload: { title, questions, recipients, created_by: senderId },
+      payload: {
+        title,
+        questions,
+        created_by: senderId,
+        channels: selectedChannels,
+        includeChannelMembers: includePulseChannelMembers,
+        usergroupIds,
+        individualUsers,
+      },
       scheduled_at: scheduleAt,
     });
 
     await client.chat.postMessage({
       channel: senderId,
       text: `✅ Pulse scheduled!`,
-      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *Pulse scheduled!*\n📊 *"${title}"*\n\n⏰ Will be sent to *${recipients.length}* recipient${recipients.length !== 1 ? 's' : ''} at the scheduled time with ${questions.length} question${questions.length !== 1 ? 's' : ''}.` } }],
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `✅ *Pulse scheduled!*\n📊 *"${title}"*\n\n⏰ Will be sent at the scheduled time with ${questions.length} question${questions.length !== 1 ? 's' : ''}.${selectedChannels.length ? `\n📢 Will post in *${selectedChannels.length}* channel${selectedChannels.length !== 1 ? 's' : ''}.` : ''}${includePulseChannelMembers ? `\n👥 Will DM all channel members.` : ''}` } }],
     });
     return;
   }
@@ -823,7 +874,7 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   if (questions.length === 0) { await client.chat.postMessage({ channel: senderId, text: '❌ Please add at least one question to your pulse.' }); return; }
   const hasAudience = groupValues.length > 0 || selectedChannels.length > 0 || individualUsers.length > 0;
   if (!hasAudience) { await client.chat.postMessage({ channel: senderId, text: '❌ No audience selected. Pick a group, channel, or add individuals.' }); return; }
-  const { userIds, groupName, targetType, targetRaw, channelPostTargets } = await resolvePulseAudience(client, groupValues, selectedChannels, individualUsers, senderId, logger);
+  const { userIds, groupName, targetType, targetRaw, channelPostTargets } = await resolvePulseAudience(client, groupValues, selectedChannels, individualUsers, senderId, includePulseChannelMembers, logger);
   if (userIds.length === 0 && channelPostTargets.length === 0) { await client.chat.postMessage({ channel: senderId, text: `❌ Couldn't resolve any recipients. Check the group has members, add individuals, or pick a channel.` }); return; }
   let senderDisplayName = senderName;
   try {
@@ -1018,7 +1069,7 @@ function buildPulseProgressBar(current, total) {
 // ============================================================
 //  Pulse audience resolver
 // ============================================================
-async function resolvePulseAudience(client, groupValues, selectedChannels, individualUsers, senderId, logger) {
+async function resolvePulseAudience(client, groupValues, selectedChannels, individualUsers, senderId, includeChannelMembers, logger) {
   let userIds = [];
   const groupNameParts = [];
   let targetType = 'manual';
@@ -1044,8 +1095,10 @@ async function resolvePulseAudience(client, groupValues, selectedChannels, indiv
       channelPostTargets.push({ id: channelId, name: chanName });
       targetType = 'channel';
       targetRaw = `channel:${channelId}:${chanName}`;
-      const membersRes = await client.conversations.members({ channel: channelId });
-      userIds = userIds.concat((membersRes.members || []).filter(id => id !== senderId));
+      if (includeChannelMembers) {
+        const members = await listAllChannelMembers(client, channelId, logger);
+        userIds = userIds.concat(members.filter((id) => id !== senderId));
+      }
     } catch (err) { logger.error('Error resolving pulse channel:', err); }
   }
   if (individualUsers.length > 0) {
