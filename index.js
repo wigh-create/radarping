@@ -1195,7 +1195,7 @@ async function buildPulsePickerOptions(senderId) {
 // ============================================================
 app.command('/radarpulse-results', async ({ ack, body, client, logger }) => {
   await ack();
-  const options = await buildPulsePickerOptions(body.user.id);
+  const options = await buildPulsePickerOptions(body.user_id);
   if (options.length === 0) {
     await client.views.open({
       trigger_id: body.trigger_id,
@@ -1241,7 +1241,7 @@ app.view('pulse_results_modal_submit', async ({ ack, body, view, client, logger 
 // ============================================================
 app.command('/radarpulse-export', async ({ ack, body, client, logger }) => {
   await ack();
-  const options = await buildPulsePickerOptions(body.user.id);
+  const options = await buildPulsePickerOptions(body.user_id);
   if (options.length === 0) {
     await client.views.open({
       trigger_id: body.trigger_id,
