@@ -632,7 +632,7 @@ async function openPulseModal({ client, triggerId, logger }) {
 //  buildPulseModalBlocks — dynamic growth version
 //  Field order: Title → Groups → Channels → Individuals → [divider] → Questions → Schedule
 // ------------------------------------------------------------
-function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Set()) {
+function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Set(), visibleChoiceBlocks = new Set()) {
   const blocks = [
     {
       type: 'input',
@@ -684,9 +684,9 @@ function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Se
   ];
   for (let i = 1; i <= questionsVisible; i++) {
     const required = i === 1;
-    blocks.push(...buildQuestionBlocks(i, required, visibleLabelBlocks.has(`pulse_q${i}_type_block`)));
+    blocks.push(...buildQuestionBlocks(i, required, visibleLabelBlocks.has(`pulse_q${i}_type_block`), visibleChoiceBlocks.has(`pulse_q${i}_type_block`)));
   }
-  if (questionsVisible < 5) {
+  if (questionsVisible < 20) {
     const next = questionsVisible + 1;
     blocks.push({
       type: 'actions',
@@ -709,7 +709,7 @@ function buildPulseModalBlocks(questionsVisible = 1, visibleLabelBlocks = new Se
 // ------------------------------------------------------------
 //  buildQuestionBlocks — renders one question slot
 // ------------------------------------------------------------
-function buildQuestionBlocks(num, required, showLabels = false) {
+function buildQuestionBlocks(num, required, showLabels = false, showChoices = false) {
   const label = required ? `Question ${num}` : `Question ${num} (optional)`;
   const blocks = [
     {
@@ -732,6 +732,7 @@ function buildQuestionBlocks(num, required, showLabels = false) {
           { text: { type: 'plain_text', text: 'Scale 1–10', emoji: true }, value: 'scale_10' },
           { text: { type: 'plain_text', text: 'Scale 1–5', emoji: true }, value: 'scale_5' },
           { text: { type: 'plain_text', text: 'Free text', emoji: true }, value: 'free_text' },
+          { text: { type: 'plain_text', text: 'Multiple choice', emoji: true }, value: 'multi_select' },
         ],
         initial_option: { text: { type: 'plain_text', text: 'Scale 1–10', emoji: true }, value: 'scale_10' },
       },
@@ -744,6 +745,15 @@ function buildQuestionBlocks(num, required, showLabels = false) {
       { type: 'input', block_id: `pulse_q${num}_high_block`, optional: true, element: { type: 'plain_text_input', action_id: `pulse_q${num}_high_input`, placeholder: { type: 'plain_text', text: 'e.g. Extremely' }, max_length: 50 }, label: { type: 'plain_text', text: `↗️ High label (optional)`, emoji: true } }
     );
   }
+  if (showChoices) {
+    blocks.push(
+      { type: 'input', block_id: `pulse_q${num}_choice1_block`, optional: false, element: { type: 'plain_text_input', action_id: `pulse_q${num}_choice1_input`, placeholder: { type: 'plain_text', text: 'Choice 1' }, max_length: 75 }, label: { type: 'plain_text', text: '1️⃣ Choice 1', emoji: true } },
+      { type: 'input', block_id: `pulse_q${num}_choice2_block`, optional: true, element: { type: 'plain_text_input', action_id: `pulse_q${num}_choice2_input`, placeholder: { type: 'plain_text', text: 'Choice 2 (optional)' }, max_length: 75 }, label: { type: 'plain_text', text: '2️⃣ Choice 2', emoji: true } },
+      { type: 'input', block_id: `pulse_q${num}_choice3_block`, optional: true, element: { type: 'plain_text_input', action_id: `pulse_q${num}_choice3_input`, placeholder: { type: 'plain_text', text: 'Choice 3 (optional)' }, max_length: 75 }, label: { type: 'plain_text', text: '3️⃣ Choice 3', emoji: true } },
+      { type: 'input', block_id: `pulse_q${num}_choice4_block`, optional: true, element: { type: 'plain_text_input', action_id: `pulse_q${num}_choice4_input`, placeholder: { type: 'plain_text', text: 'Choice 4 (optional)' }, max_length: 75 }, label: { type: 'plain_text', text: '4️⃣ Choice 4', emoji: true } },
+      { type: 'input', block_id: `pulse_q${num}_free_text_block`, optional: true, element: { type: 'checkboxes', action_id: `pulse_q${num}_free_text_input`, options: [{ text: { type: 'plain_text', text: 'Also allow free text response', emoji: true }, value: 'allow_free_text' }] }, label: { type: 'plain_text', text: '✏️ Optional free fill', emoji: true } }
+    );
+  }
   return blocks;
 }
 // ============================================================
@@ -753,15 +763,18 @@ function getPulseViewState(view) {
   const blocks = view.blocks || [];
   let questionsVisible = 0;
   const visibleLabelBlocks = new Set();
+  const visibleChoiceBlocks = new Set();
   for (const b of blocks) {
     if (b.block_id && /^pulse_q\d+_text_block$/.test(b.block_id)) questionsVisible++;
     if (b.block_id && /^pulse_q\d+_type_block$/.test(b.block_id)) {
       const num = b.block_id.match(/pulse_q(\d+)_type_block/)[1];
       const hasLow = blocks.some(lb => lb.block_id === `pulse_q${num}_low_block`);
       if (hasLow) visibleLabelBlocks.add(`pulse_q${num}_type_block`);
+      const hasChoices = blocks.some(lb => lb.block_id === `pulse_q${num}_choice1_block`);
+      if (hasChoices) visibleChoiceBlocks.add(`pulse_q${num}_type_block`);
     }
   }
-  return { questionsVisible: Math.max(questionsVisible, 1), visibleLabelBlocks };
+  return { questionsVisible: Math.max(questionsVisible, 1), visibleLabelBlocks, visibleChoiceBlocks };
 }
 // ============================================================
 //  block_actions: "+ Add question N" buttons
@@ -769,10 +782,10 @@ function getPulseViewState(view) {
 app.action(/^add_question_(\d+)$/, async ({ ack, body, action, client, logger }) => {
   await ack();
   const view = body.view;
-  const { questionsVisible, visibleLabelBlocks } = getPulseViewState(view);
+  const { questionsVisible, visibleLabelBlocks, visibleChoiceBlocks } = getPulseViewState(view);
   const targetQ = parseInt(action.action_id.replace('add_question_', ''), 10);
   const newVisible = Math.max(questionsVisible, targetQ);
-  const newBlocks = buildPulseModalBlocks(newVisible, visibleLabelBlocks);
+  const newBlocks = buildPulseModalBlocks(newVisible, visibleLabelBlocks, visibleChoiceBlocks);
   try {
     await client.views.update({
       view_id: view.id, hash: view.hash,
@@ -788,10 +801,19 @@ app.action(/^pulse_q(\d+)_type_input$/, async ({ ack, body, action, client, logg
   const view = body.view;
   const num = action.action_id.match(/pulse_q(\d+)_type_input/)[1];
   const selectedType = action.selected_option?.value;
-  const { questionsVisible, visibleLabelBlocks } = getPulseViewState(view);
+  const { questionsVisible, visibleLabelBlocks, visibleChoiceBlocks } = getPulseViewState(view);
   const typeBlockId = `pulse_q${num}_type_block`;
-  if (selectedType === 'scale_10' || selectedType === 'scale_5') { visibleLabelBlocks.add(typeBlockId); } else { visibleLabelBlocks.delete(typeBlockId); }
-  const newBlocks = buildPulseModalBlocks(questionsVisible, visibleLabelBlocks);
+  if (selectedType === 'scale_10' || selectedType === 'scale_5') {
+    visibleLabelBlocks.add(typeBlockId);
+    visibleChoiceBlocks.delete(typeBlockId);
+  } else if (selectedType === 'multi_select') {
+    visibleChoiceBlocks.add(typeBlockId);
+    visibleLabelBlocks.delete(typeBlockId);
+  } else {
+    visibleLabelBlocks.delete(typeBlockId);
+    visibleChoiceBlocks.delete(typeBlockId);
+  }
+  const newBlocks = buildPulseModalBlocks(questionsVisible, visibleLabelBlocks, visibleChoiceBlocks);
   try {
     await client.views.update({
       view_id: view.id, hash: view.hash,
@@ -817,12 +839,18 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   const scheduleAt = values?.schedule_block?.schedule_at?.selected_date_time;
   if (scheduleAt) {
     const questions = [];
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 20; i++) {
       const text = values[`pulse_q${i}_text_block`]?.[`pulse_q${i}_text_input`]?.value;
       const responseType = values[`pulse_q${i}_type_block`]?.[`pulse_q${i}_type_input`]?.selected_option?.value;
       const lowLabel = values[`pulse_q${i}_low_block`]?.[`pulse_q${i}_low_input`]?.value || null;
       const highLabel = values[`pulse_q${i}_high_block`]?.[`pulse_q${i}_high_input`]?.value || null;
-      if (text && responseType) questions.push({ index: questions.length, text, response_type: responseType, low_label: lowLabel, high_label: highLabel });
+      const choice1 = values[`pulse_q${i}_choice1_block`]?.[`pulse_q${i}_choice1_input`]?.value || null;
+      const choice2 = values[`pulse_q${i}_choice2_block`]?.[`pulse_q${i}_choice2_input`]?.value || null;
+      const choice3 = values[`pulse_q${i}_choice3_block`]?.[`pulse_q${i}_choice3_input`]?.value || null;
+      const choice4 = values[`pulse_q${i}_choice4_block`]?.[`pulse_q${i}_choice4_input`]?.value || null;
+      const choices = [choice1, choice2, choice3, choice4].filter(Boolean);
+      const allowFreeText = (values[`pulse_q${i}_free_text_block`]?.[`pulse_q${i}_free_text_input`]?.selected_options || []).some(o => o.value === 'allow_free_text');
+      if (text && responseType) questions.push({ index: questions.length, text, response_type: responseType, low_label: lowLabel, high_label: highLabel, ...(choices.length ? { choices } : {}), ...(allowFreeText ? { allow_free_text: true } : {}) });
     }
     if (questions.length === 0) { await client.chat.postMessage({ channel: senderId, text: '❌ Please add at least one question to your pulse.' }); return; }
 
@@ -864,12 +892,18 @@ app.view('pulse_modal_submit', async ({ ack, body, view, client, logger }) => {
   const selectedChannels = values.pulse_channel_block?.pulse_channel_select?.selected_conversations || [];
   const individualUsers = values.pulse_individuals_block?.pulse_individuals_input?.selected_users || [];
   const questions = [];
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 1; i <= 20; i++) {
     const text = values[`pulse_q${i}_text_block`]?.[`pulse_q${i}_text_input`]?.value;
     const responseType = values[`pulse_q${i}_type_block`]?.[`pulse_q${i}_type_input`]?.selected_option?.value;
     const lowLabel = values[`pulse_q${i}_low_block`]?.[`pulse_q${i}_low_input`]?.value || null;
     const highLabel = values[`pulse_q${i}_high_block`]?.[`pulse_q${i}_high_input`]?.value || null;
-    if (text && responseType) questions.push({ index: questions.length, text, response_type: responseType, low_label: lowLabel, high_label: highLabel });
+    const choice1 = values[`pulse_q${i}_choice1_block`]?.[`pulse_q${i}_choice1_input`]?.value || null;
+    const choice2 = values[`pulse_q${i}_choice2_block`]?.[`pulse_q${i}_choice2_input`]?.value || null;
+    const choice3 = values[`pulse_q${i}_choice3_block`]?.[`pulse_q${i}_choice3_input`]?.value || null;
+    const choice4 = values[`pulse_q${i}_choice4_block`]?.[`pulse_q${i}_choice4_input`]?.value || null;
+    const choices = [choice1, choice2, choice3, choice4].filter(Boolean);
+    const allowFreeText = (values[`pulse_q${i}_free_text_block`]?.[`pulse_q${i}_free_text_input`]?.selected_options || []).some(o => o.value === 'allow_free_text');
+    if (text && responseType) questions.push({ index: questions.length, text, response_type: responseType, low_label: lowLabel, high_label: highLabel, ...(choices.length ? { choices } : {}), ...(allowFreeText ? { allow_free_text: true } : {}) });
   }
   if (questions.length === 0) { await client.chat.postMessage({ channel: senderId, text: '❌ Please add at least one question to your pulse.' }); return; }
   const hasAudience = groupValues.length > 0 || selectedChannels.length > 0 || individualUsers.length > 0;
@@ -937,6 +971,22 @@ app.action(/^pulse_scale_\d+$/, async ({ ack, body, action, client, logger }) =>
   const score = parseInt(scoreStr, 10);
   if (!campaignId || isNaN(questionIndex) || isNaN(score)) { logger.warn('pulse_scale_button: invalid action value', action.value); return; }
   await handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer: score, score, body });
+});
+// ============================================================
+//  Pulse: multi-select choice button click
+// ============================================================
+app.action(/^pulse_multiselect_\d+$/, async ({ ack, body, action, client, logger }) => {
+  await ack();
+  const userId = body.user.id;
+  const [campaignId, questionIndexStr, choiceIndexStr] = (action.value || '').split(':');
+  const questionIndex = parseInt(questionIndexStr, 10);
+  const choiceIndex = parseInt(choiceIndexStr, 10);
+  if (!campaignId || isNaN(questionIndex) || isNaN(choiceIndex)) { logger.warn('pulse_multiselect: invalid action value', action.value); return; }
+  const campaign = await db.getPulseCampaign(campaignId);
+  if (!campaign) { logger.warn(`pulse_multiselect: campaign ${campaignId} not found`); return; }
+  const choices = campaign.questions[questionIndex]?.choices || [];
+  const answer = choices[choiceIndex] ?? `Choice ${choiceIndex + 1}`;
+  await handlePulseAnswer({ client, logger, userId, campaignId, questionIndex, answer, score: null, body });
 });
 // ============================================================
 //  Pulse: free text submit button click
@@ -1053,6 +1103,16 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
       blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `${question.low_label ? `_${question.low_label}_ ←` : ''} ${question.high_label ? `→ _${question.high_label}_` : ''}`.trim() }] });
     }
     blocks.push({ type: 'actions', elements: [1,2,3,4,5].map(n => ({ type: 'button', text: { type: 'plain_text', text: String(n), emoji: true }, action_id: `pulse_scale_${n}`, value: `${campaign.id}:${questionIndex}:${n}` })) });
+  } else if (question.response_type === 'multi_select') {
+    const choices = question.choices || [];
+    if (choices.length > 0) {
+      blocks.push({ type: 'actions', elements: choices.map((choice, idx) => ({ type: 'button', text: { type: 'plain_text', text: choice, emoji: true }, action_id: `pulse_multiselect_${idx}`, value: `${campaign.id}:${questionIndex}:${idx}` })) });
+    }
+    if (question.allow_free_text) {
+      const blockId = `pulse_text_input_${questionIndex}`;
+      blocks.push({ type: 'input', block_id: blockId, optional: true, dispatch_action: false, element: { type: 'plain_text_input', action_id: 'pulse_text_value', multiline: false, placeholder: { type: 'plain_text', text: 'Or type your own answer...' } }, label: { type: 'plain_text', text: 'Free text (optional)', emoji: true } });
+      blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Submit text →', emoji: true }, action_id: 'pulse_text_submit', value: `${campaign.id}:${questionIndex}`, style: 'primary' }] });
+    }
   } else {
     const blockId = `pulse_text_input_${questionIndex}`;
     blocks.push({ type: 'input', block_id: blockId, optional: true, dispatch_action: false, element: { type: 'plain_text_input', action_id: 'pulse_text_value', multiline: true, placeholder: { type: 'plain_text', text: 'Type your answer here...' } }, label: { type: 'plain_text', text: 'Your answer', emoji: true } });

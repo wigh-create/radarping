@@ -256,7 +256,7 @@ async function updatePulseResponseAnswers({ responsePageId, answers }) {
         const props = {};
         answers.forEach((a, i) => {
             const qNum = i + 1;
-            if (qNum > 5) return;
+            if (qNum > 20) return;
 
             // Q1 Text — the question itself
             if (a.question_text) {

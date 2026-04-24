@@ -257,6 +257,16 @@ function buildPulseDMBlocks(campaign, questionIndex) {
       });
     }
     blocks.push({ type: 'actions', elements: [1, 2, 3, 4, 5].map((n) => ({ type: 'button', text: { type: 'plain_text', text: String(n), emoji: true }, action_id: `pulse_scale_${n}`, value: `${campaign.id}:${questionIndex}:${n}` })) });
+  } else if (question?.response_type === 'multi_select') {
+    const choices = question.choices || [];
+    if (choices.length > 0) {
+      blocks.push({ type: 'actions', elements: choices.map((choice, idx) => ({ type: 'button', text: { type: 'plain_text', text: choice, emoji: true }, action_id: `pulse_multiselect_${idx}`, value: `${campaign.id}:${questionIndex}:${idx}` })) });
+    }
+    if (question.allow_free_text) {
+      const blockId = `pulse_text_input_${questionIndex}`;
+      blocks.push({ type: 'input', block_id: blockId, optional: true, dispatch_action: false, element: { type: 'plain_text_input', action_id: 'pulse_text_value', multiline: false, placeholder: { type: 'plain_text', text: 'Or type your own answer...' } }, label: { type: 'plain_text', text: 'Free text (optional)', emoji: true } });
+      blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Submit text →', emoji: true }, action_id: 'pulse_text_submit', value: `${campaign.id}:${questionIndex}`, style: 'primary' }] });
+    }
   } else {
     const blockId = `pulse_text_input_${questionIndex}`;
     blocks.push({
