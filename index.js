@@ -1201,10 +1201,16 @@ app.command('/radarpulse-results', async ({ ack, body, client, logger }) => {
     blocks.push({
       type: 'section',
       text: { type: 'mrkdwn', text: `*${campaign.title}*\n${sentDate} · ${completed}/${total} responded (${pct}%) · ${campaign.questions.length} question${campaign.questions.length !== 1 ? 's' : ''}` },
-      accessory: { type: 'button', text: { type: 'plain_text', text: 'View Results', emoji: true }, action_id: 'view_pulse_results', value: campaign.id },
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [
+        { type: 'button', text: { type: 'plain_text', text: '📊 View Results', emoji: true }, action_id: 'view_pulse_results', value: campaign.id },
+        { type: 'button', text: { type: 'plain_text', text: '⬇️ Export CSV', emoji: true }, action_id: 'export_pulse_csv', value: campaign.id },
+      ],
     });
   }
-  await client.chat.postMessage({ channel: senderId, blocks, text: 'Your recent pulses — click View Results to see a breakdown.' });
+  await client.chat.postMessage({ channel: senderId, blocks, text: 'Your recent pulses — view results or export as CSV.' });
 });
 // ============================================================
 //  block_actions: "View Results" button
@@ -1225,6 +1231,101 @@ app.action('view_pulse_results', async ({ ack, body, action, client, logger }) =
     }
   } catch (err) { logger.error('view_pulse_results error:', err); }
 });
+// ============================================================
+//  /radarpulse-export — same list view, CSV export buttons only
+// ============================================================
+app.command('/radarpulse-export', async ({ ack, body, client, logger }) => {
+  await ack();
+  const senderId = body.user.id;
+  const campaigns = await db.getRecentPulseCampaigns(senderId, 10);
+  if (campaigns.length === 0) {
+    await client.chat.postMessage({ channel: senderId, text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." });
+    return;
+  }
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: '⬇️ Export Pulse Results', emoji: true } },
+    { type: 'divider' },
+  ];
+  for (const campaign of campaigns) {
+    const { rows } = await db.countCompletedPulseResponses(campaign.id);
+    const completed = parseInt(rows?.[0]?.count || 0);
+    const total = campaign.resolved_users.length;
+    const sentDate = new Date(campaign.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*${campaign.title}*\n${sentDate} · ${completed}/${total} responded` },
+      accessory: { type: 'button', text: { type: 'plain_text', text: '⬇️ Export CSV', emoji: true }, action_id: 'export_pulse_csv', value: campaign.id },
+    });
+  }
+  await client.chat.postMessage({ channel: senderId, blocks, text: 'Select a pulse to export as CSV.' });
+});
+// ============================================================
+//  block_actions: "Export CSV" button
+// ============================================================
+app.action('export_pulse_csv', async ({ ack, body, action, client, logger }) => {
+  await ack();
+  const campaignId = action.value;
+  const userId = body.user.id;
+  try {
+    const campaign = await db.getPulseCampaign(campaignId);
+    if (!campaign) { await client.chat.postMessage({ channel: userId, text: '❌ Pulse not found.' }); return; }
+    const allResponses = await db.getAllPulseResponses(campaignId);
+    const completed = allResponses.filter(r => r.completed_at);
+    if (completed.length === 0) {
+      await client.chat.postMessage({ channel: userId, text: `ℹ️ No completed responses yet for *"${campaign.title}"*.` });
+      return;
+    }
+    const csv = buildPulseCSV(campaign, completed);
+    const safeTitle = campaign.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const filename = `pulse-${safeTitle}.csv`;
+    await client.files.uploadV2({
+      channel_id: userId,
+      filename,
+      content: csv,
+      title: campaign.title,
+      initial_comment: `📊 *${campaign.title}* — ${completed.length} response${completed.length !== 1 ? 's' : ''} exported`,
+    });
+  } catch (err) { logger.error('export_pulse_csv error:', err); }
+});
+// ============================================================
+//  buildPulseCSV — generates CSV string for a campaign
+// ============================================================
+function csvEscape(val) {
+  if (val == null) return '';
+  const str = String(val);
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  return str;
+}
+function buildPulseCSV(campaign, completedResponses) {
+  const questions = campaign.questions;
+  const headers = [
+    'Respondent',
+    'Slack ID',
+    'Responded At',
+    ...questions.map(q => `Q${q.index + 1}: ${q.text}`),
+  ];
+  const rows = [headers.map(csvEscape).join(',')];
+  for (const response of completedResponses) {
+    const respondedAt = response.completed_at
+      ? new Date(response.completed_at * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC'
+      : '';
+    const cols = [
+      response.slack_display_name || response.slack_user_id,
+      response.slack_user_id,
+      respondedAt,
+      ...questions.map(q => {
+        const answer = response.answers[q.index];
+        if (!answer) return '';
+        if (q.response_type === 'scale_10' || q.response_type === 'scale_5') return answer.score ?? '';
+        return answer.answer ?? '';
+      }),
+    ];
+    rows.push(cols.map(csvEscape).join(','));
+  }
+  return rows.join('\n');
+}
 // ============================================================
 //  buildPulseResultsBlocks — formats full results for one campaign
 // ============================================================
@@ -1293,6 +1394,7 @@ function buildPulseResultsBlocks(campaign, completedResponses) {
   console.log(`     /announce          - Send a tracked announcement`);
   console.log(`     /radarping         - Alias for /announce`);
   console.log(`     /announce-status   - View read receipts`);
-  console.log(`     /radarpulse        - Send a pulse quiz`);
-  console.log(`     /radarpulse-results - View pulse response summaries\n`);
+  console.log(`     /radarpulse         - Send a pulse quiz`);
+  console.log(`     /radarpulse-results - View pulse response summaries`);
+  console.log(`     /radarpulse-export  - Export pulse responses as CSV\n`);
 })();
