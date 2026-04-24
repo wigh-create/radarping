@@ -1178,94 +1178,99 @@ async function resolvePulseAudience(client, groupValues, selectedChannels, indiv
   return { userIds: allUserIds, groupName, targetType, targetRaw, channelPostTargets };
 }
 // ============================================================
-//  /radarpulse-results — view response summary for recent pulses
+//  Shared helper: build pulse picker modal options
+// ============================================================
+async function buildPulsePickerOptions(senderId) {
+  const campaigns = await db.getRecentPulseCampaigns(senderId, 10);
+  return campaigns.map(c => {
+    const d = new Date(c.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    return {
+      text: { type: 'plain_text', text: `${c.title} — ${d}`, emoji: true },
+      value: c.id,
+    };
+  });
+}
+// ============================================================
+//  /radarpulse-results — modal picker → DM breakdown
 // ============================================================
 app.command('/radarpulse-results', async ({ ack, body, client, logger }) => {
   await ack();
-  const senderId = body.user.id;
-  const campaigns = await db.getRecentPulseCampaigns(senderId, 10);
-  if (campaigns.length === 0) {
-    await client.chat.postMessage({ channel: senderId, text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." });
+  const options = await buildPulsePickerOptions(body.user.id);
+  if (options.length === 0) {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: { type: 'modal', title: { type: 'plain_text', text: 'No Pulses Found' }, close: { type: 'plain_text', text: 'Close' }, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." } }] },
+    });
     return;
   }
-  const blocks = [
-    { type: 'header', text: { type: 'plain_text', text: '📊 Your Recent Pulses', emoji: true } },
-    { type: 'divider' },
-  ];
-  for (const campaign of campaigns) {
-    const { rows } = await db.countCompletedPulseResponses(campaign.id);
-    const completed = parseInt(rows?.[0]?.count || 0);
-    const total = campaign.resolved_users.length;
-    const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
-    const sentDate = new Date(campaign.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: `*${campaign.title}*\n${sentDate} · ${completed}/${total} responded (${pct}%) · ${campaign.questions.length} question${campaign.questions.length !== 1 ? 's' : ''}` },
-    });
-    blocks.push({
-      type: 'actions',
-      elements: [
-        { type: 'button', text: { type: 'plain_text', text: '📊 View Results', emoji: true }, action_id: 'view_pulse_results', value: campaign.id },
-        { type: 'button', text: { type: 'plain_text', text: '⬇️ Export CSV', emoji: true }, action_id: 'export_pulse_csv', value: campaign.id },
-      ],
-    });
-  }
-  await client.chat.postMessage({ channel: senderId, blocks, text: 'Your recent pulses — view results or export as CSV.' });
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal',
+      callback_id: 'pulse_results_modal_submit',
+      title: { type: 'plain_text', text: '📊 View Pulse Results', emoji: true },
+      submit: { type: 'plain_text', text: 'View Results →', emoji: true },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [{
+        type: 'input',
+        block_id: 'pulse_pick_block',
+        label: { type: 'plain_text', text: 'Select a pulse', emoji: true },
+        element: { type: 'static_select', action_id: 'pulse_pick_input', placeholder: { type: 'plain_text', text: 'Choose one...' }, options },
+      }],
+    },
+  });
 });
-// ============================================================
-//  block_actions: "View Results" button
-// ============================================================
-app.action('view_pulse_results', async ({ ack, body, action, client, logger }) => {
+app.view('pulse_results_modal_submit', async ({ ack, body, view, client, logger }) => {
   await ack();
-  const campaignId = action.value;
   const userId = body.user.id;
+  const campaignId = view.state.values.pulse_pick_block.pulse_pick_input.selected_option?.value;
+  if (!campaignId) return;
   try {
     const campaign = await db.getPulseCampaign(campaignId);
     if (!campaign) { await client.chat.postMessage({ channel: userId, text: '❌ Pulse not found.' }); return; }
     const allResponses = await db.getAllPulseResponses(campaignId);
     const completed = allResponses.filter(r => r.completed_at);
     const resultBlocks = buildPulseResultsBlocks(campaign, completed);
-    // Slack allows max 50 blocks per message — chunk if needed
     for (let i = 0; i < resultBlocks.length; i += 45) {
       await client.chat.postMessage({ channel: userId, blocks: resultBlocks.slice(i, i + 45), text: `Results: "${campaign.title}"` });
     }
-  } catch (err) { logger.error('view_pulse_results error:', err); }
+  } catch (err) { logger.error('pulse_results_modal_submit error:', err); }
 });
 // ============================================================
-//  /radarpulse-export — same list view, CSV export buttons only
+//  /radarpulse-export — modal picker → DM CSV file
 // ============================================================
 app.command('/radarpulse-export', async ({ ack, body, client, logger }) => {
   await ack();
-  const senderId = body.user.id;
-  const campaigns = await db.getRecentPulseCampaigns(senderId, 10);
-  if (campaigns.length === 0) {
-    await client.chat.postMessage({ channel: senderId, text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." });
+  const options = await buildPulsePickerOptions(body.user.id);
+  if (options.length === 0) {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: { type: 'modal', title: { type: 'plain_text', text: 'No Pulses Found' }, close: { type: 'plain_text', text: 'Close' }, blocks: [{ type: 'section', text: { type: 'mrkdwn', text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." } }] },
+    });
     return;
   }
-  const blocks = [
-    { type: 'header', text: { type: 'plain_text', text: '⬇️ Export Pulse Results', emoji: true } },
-    { type: 'divider' },
-  ];
-  for (const campaign of campaigns) {
-    const { rows } = await db.countCompletedPulseResponses(campaign.id);
-    const completed = parseInt(rows?.[0]?.count || 0);
-    const total = campaign.resolved_users.length;
-    const sentDate = new Date(campaign.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: `*${campaign.title}*\n${sentDate} · ${completed}/${total} responded` },
-      accessory: { type: 'button', text: { type: 'plain_text', text: '⬇️ Export CSV', emoji: true }, action_id: 'export_pulse_csv', value: campaign.id },
-    });
-  }
-  await client.chat.postMessage({ channel: senderId, blocks, text: 'Select a pulse to export as CSV.' });
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal',
+      callback_id: 'pulse_export_modal_submit',
+      title: { type: 'plain_text', text: '⬇️ Export Pulse CSV', emoji: true },
+      submit: { type: 'plain_text', text: 'Export CSV →', emoji: true },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [{
+        type: 'input',
+        block_id: 'pulse_pick_block',
+        label: { type: 'plain_text', text: 'Select a pulse', emoji: true },
+        element: { type: 'static_select', action_id: 'pulse_pick_input', placeholder: { type: 'plain_text', text: 'Choose one...' }, options },
+      }],
+    },
+  });
 });
-// ============================================================
-//  block_actions: "Export CSV" button
-// ============================================================
-app.action('export_pulse_csv', async ({ ack, body, action, client, logger }) => {
+app.view('pulse_export_modal_submit', async ({ ack, body, view, client, logger }) => {
   await ack();
-  const campaignId = action.value;
   const userId = body.user.id;
+  const campaignId = view.state.values.pulse_pick_block.pulse_pick_input.selected_option?.value;
+  if (!campaignId) return;
   try {
     const campaign = await db.getPulseCampaign(campaignId);
     if (!campaign) { await client.chat.postMessage({ channel: userId, text: '❌ Pulse not found.' }); return; }
@@ -1277,15 +1282,14 @@ app.action('export_pulse_csv', async ({ ack, body, action, client, logger }) => 
     }
     const csv = buildPulseCSV(campaign, completed);
     const safeTitle = campaign.title.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
-    const filename = `pulse-${safeTitle}.csv`;
     await client.files.uploadV2({
       channel_id: userId,
-      filename,
+      filename: `pulse-${safeTitle}.csv`,
       content: csv,
       title: campaign.title,
       initial_comment: `📊 *${campaign.title}* — ${completed.length} response${completed.length !== 1 ? 's' : ''} exported`,
     });
-  } catch (err) { logger.error('export_pulse_csv error:', err); }
+  } catch (err) { logger.error('pulse_export_modal_submit error:', err); }
 });
 // ============================================================
 //  buildPulseCSV — generates CSV string for a campaign
