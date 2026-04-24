@@ -1178,6 +1178,109 @@ async function resolvePulseAudience(client, groupValues, selectedChannels, indiv
   return { userIds: allUserIds, groupName, targetType, targetRaw, channelPostTargets };
 }
 // ============================================================
+//  /radarpulse-results — view response summary for recent pulses
+// ============================================================
+app.command('/radarpulse-results', async ({ ack, body, client, logger }) => {
+  await ack();
+  const senderId = body.user.id;
+  const campaigns = await db.getRecentPulseCampaigns(senderId, 10);
+  if (campaigns.length === 0) {
+    await client.chat.postMessage({ channel: senderId, text: "You haven't sent any pulses yet. Use `/radarpulse` to send your first one." });
+    return;
+  }
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: '📊 Your Recent Pulses', emoji: true } },
+    { type: 'divider' },
+  ];
+  for (const campaign of campaigns) {
+    const { rows } = await db.countCompletedPulseResponses(campaign.id);
+    const completed = parseInt(rows?.[0]?.count || 0);
+    const total = campaign.resolved_users.length;
+    const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const sentDate = new Date(campaign.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*${campaign.title}*\n${sentDate} · ${completed}/${total} responded (${pct}%) · ${campaign.questions.length} question${campaign.questions.length !== 1 ? 's' : ''}` },
+      accessory: { type: 'button', text: { type: 'plain_text', text: 'View Results', emoji: true }, action_id: 'view_pulse_results', value: campaign.id },
+    });
+  }
+  await client.chat.postMessage({ channel: senderId, blocks, text: 'Your recent pulses — click View Results to see a breakdown.' });
+});
+// ============================================================
+//  block_actions: "View Results" button
+// ============================================================
+app.action('view_pulse_results', async ({ ack, body, action, client, logger }) => {
+  await ack();
+  const campaignId = action.value;
+  const userId = body.user.id;
+  try {
+    const campaign = await db.getPulseCampaign(campaignId);
+    if (!campaign) { await client.chat.postMessage({ channel: userId, text: '❌ Pulse not found.' }); return; }
+    const allResponses = await db.getAllPulseResponses(campaignId);
+    const completed = allResponses.filter(r => r.completed_at);
+    const resultBlocks = buildPulseResultsBlocks(campaign, completed);
+    // Slack allows max 50 blocks per message — chunk if needed
+    for (let i = 0; i < resultBlocks.length; i += 45) {
+      await client.chat.postMessage({ channel: userId, blocks: resultBlocks.slice(i, i + 45), text: `Results: "${campaign.title}"` });
+    }
+  } catch (err) { logger.error('view_pulse_results error:', err); }
+});
+// ============================================================
+//  buildPulseResultsBlocks — formats full results for one campaign
+// ============================================================
+function buildPulseResultsBlocks(campaign, completedResponses) {
+  const totalSent = campaign.resolved_users?.length || 0;
+  const responded = completedResponses.length;
+  const pct = totalSent > 0 ? Math.round((responded / totalSent) * 100) : 0;
+  const sentDate = new Date(campaign.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: `📊 ${campaign.title}`, emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: `Sent *${sentDate}* · *${responded}* of *${totalSent}* responded *(${pct}%)*` } },
+    { type: 'divider' },
+  ];
+  for (const question of campaign.questions) {
+    const qi = question.index;
+    const answersForQ = completedResponses.map(r => r.answers[qi]).filter(a => a != null);
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Q${qi + 1}: ${question.text}*` } });
+    if (answersForQ.length === 0) {
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: '_No responses yet_' }] });
+    } else if (question.response_type === 'scale_10' || question.response_type === 'scale_5') {
+      const scores = answersForQ.map(a => a.score).filter(s => s != null);
+      const avg = (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1);
+      const max = question.response_type === 'scale_10' ? 10 : 5;
+      const dist = {};
+      for (let n = 1; n <= max; n++) dist[n] = 0;
+      scores.forEach(s => { if (dist[s] !== undefined) dist[s]++; });
+      const distText = Object.entries(dist).map(([n, c]) => `${n}▸${c}`).join('  ');
+      const lowHigh = (question.low_label || question.high_label) ? `\n_${question.low_label || ''}_ → _${question.high_label || ''}_` : '';
+      blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `avg *${avg}* · ${scores.length} response${scores.length !== 1 ? 's' : ''}${lowHigh}\n\`${distText}\`` }] });
+    } else if (question.response_type === 'multi_select') {
+      const choices = question.choices || [];
+      const counts = {};
+      choices.forEach(c => { counts[c] = 0; });
+      answersForQ.forEach(a => {
+        const ans = String(a.answer || '');
+        counts[ans] = (counts[ans] || 0) + 1;
+      });
+      const lines = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([choice, count]) => {
+        const p = Math.round((count / answersForQ.length) * 100);
+        const bar = '█'.repeat(Math.round(p / 10)) + '░'.repeat(10 - Math.round(p / 10));
+        return `${bar} *${choice}*: ${count} (${p}%)`;
+      });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n').slice(0, 3000) } });
+    } else {
+      // free_text
+      const texts = answersForQ.map(a => String(a.answer || '')).filter(Boolean);
+      const MAX_SHOW = 15;
+      const shown = texts.slice(0, MAX_SHOW).map(t => `• ${t.slice(0, 300)}`).join('\n');
+      const overflow = texts.length > MAX_SHOW ? `\n_…and ${texts.length - MAX_SHOW} more_` : '';
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: (shown + overflow).slice(0, 3000) } });
+    }
+    blocks.push({ type: 'divider' });
+  }
+  return blocks;
+}
+// ============================================================
 //  Start
 // ============================================================
 (async () => {
@@ -1190,5 +1293,6 @@ async function resolvePulseAudience(client, groupValues, selectedChannels, indiv
   console.log(`     /announce          - Send a tracked announcement`);
   console.log(`     /radarping         - Alias for /announce`);
   console.log(`     /announce-status   - View read receipts`);
-  console.log(`     /radarpulse        - Send a pulse quiz\n`);
+  console.log(`     /radarpulse        - Send a pulse quiz`);
+  console.log(`     /radarpulse-results - View pulse response summaries\n`);
 })();

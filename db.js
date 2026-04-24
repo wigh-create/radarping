@@ -311,6 +311,20 @@ async function countCompletedPulseResponses(campaign_id) {
   );
   return { rows };
 }
+async function getRecentPulseCampaigns(sender_slack_id, limit = 10) {
+  const { rows } = await pool.query(
+    `SELECT * FROM pulse_campaigns WHERE sender_slack_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [sender_slack_id, limit]
+  );
+  return rows.map(r => ({ ...r, resolved_users: JSON.parse(r.resolved_users), questions: JSON.parse(r.questions) }));
+}
+async function getAllPulseResponses(campaign_id) {
+  const { rows } = await pool.query(
+    `SELECT * FROM pulse_responses WHERE campaign_id = $1 ORDER BY started_at ASC`,
+    [campaign_id]
+  );
+  return rows.map(r => ({ ...r, answers: JSON.parse(r.answers) }));
+}
 // ============================================================
 //  Pulse State
 // ============================================================
@@ -429,6 +443,8 @@ module.exports = {
   getPulseState,
   updatePulseStateQuestion,
   deletePulseState,
+  getRecentPulseCampaigns,
+  getAllPulseResponses,
   // Scheduled Posts
   createScheduledPost,
   claimDuePosts,
