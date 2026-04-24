@@ -1105,9 +1105,13 @@ function buildPulseDMBlocks(campaign, questionIndex, _currentAnswer) {
     blocks.push({ type: 'actions', elements: [1,2,3,4,5].map(n => ({ type: 'button', text: { type: 'plain_text', text: String(n), emoji: true }, action_id: `pulse_scale_${n}`, value: `${campaign.id}:${questionIndex}:${n}` })) });
   } else if (question.response_type === 'multi_select') {
     const choices = question.choices || [];
-    if (choices.length > 0) {
-      blocks.push({ type: 'actions', elements: choices.map((choice, idx) => ({ type: 'button', text: { type: 'plain_text', text: choice, emoji: true }, action_id: `pulse_multiselect_${idx}`, value: `${campaign.id}:${questionIndex}:${idx}` })) });
-    }
+    choices.forEach((choice, idx) => {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `*${idx + 1}.* ${choice}` },
+        accessory: { type: 'button', text: { type: 'plain_text', text: 'Select', emoji: true }, action_id: `pulse_multiselect_${idx}`, value: `${campaign.id}:${questionIndex}:${idx}` },
+      });
+    });
     if (question.allow_free_text) {
       const blockId = `pulse_text_input_${questionIndex}`;
       blocks.push({ type: 'input', block_id: blockId, optional: true, dispatch_action: false, element: { type: 'plain_text_input', action_id: 'pulse_text_value', multiline: false, placeholder: { type: 'plain_text', text: 'Or type your own answer...' } }, label: { type: 'plain_text', text: 'Free text (optional)', emoji: true } });
