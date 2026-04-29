@@ -1372,19 +1372,34 @@ app.command('/radarping-review', async ({ ack, body, client, logger }) => {
   }
 });
 // Build an announcement preview (mirrors schedules.js buildAnnouncementBlocks but with neutered action_ids)
+function isValidHttpUrl(s) {
+  if (!s || typeof s !== 'string') return false;
+  return /^https?:\/\/\S+$/i.test(s.trim());
+}
+// Split a long mrkdwn message into multiple section blocks, each <= 2900 chars (safe under Slack's 3000 limit)
+function chunkMrkdwnSections(text, perBlock = 2900) {
+  const safe = String(text || '').slice(0, perBlock * 10); // hard cap ~29k
+  const out = [];
+  for (let i = 0; i < safe.length; i += perBlock) {
+    out.push({ type: 'section', text: { type: 'mrkdwn', text: safe.slice(i, i + perBlock) } });
+  }
+  return out.length ? out : [{ type: 'section', text: { type: 'mrkdwn', text: '_(no message)_' } }];
+}
 function buildAnnouncePreviewBlocks({ title, message, link }) {
+  const safeTitle = (title && String(title).trim()) || 'Announcement';
+  const validLink = isValidHttpUrl(link);
   return [
-    { type: 'header', text: { type: 'plain_text', text: `📣 ${title || 'Announcement'}`.trim(), emoji: true } },
+    { type: 'header', text: { type: 'plain_text', text: `📣 ${safeTitle}`.slice(0, 150), emoji: true } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: 'Sent by _<your name will appear here>_' }] },
     { type: 'divider' },
-    { type: 'section', text: { type: 'mrkdwn', text: message || '_(no message)_' } },
-    ...(link ? [{ type: 'section', text: { type: 'mrkdwn', text: `🔗 <${link}|View more>` } }] : []),
+    ...chunkMrkdwnSections(message),
+    ...(validLink ? [{ type: 'section', text: { type: 'mrkdwn', text: `🔗 <${link.trim()}|View more>` } }] : []),
     { type: 'divider' },
     {
       type: 'actions',
       elements: [
-        link
-          ? { type: 'button', text: { type: 'plain_text', text: '📖 Open to Read', emoji: true }, action_id: 'preview_noop_open', url: link, style: 'primary' }
+        validLink
+          ? { type: 'button', text: { type: 'plain_text', text: '📖 Open to Read', emoji: true }, action_id: 'preview_noop_open', url: link.trim(), style: 'primary' }
           : { type: 'button', text: { type: 'plain_text', text: '✅ Mark as Read', emoji: true }, action_id: 'preview_noop_mark', style: 'primary' },
       ],
     },

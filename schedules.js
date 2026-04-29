@@ -85,12 +85,20 @@ function buildAnnounceDmBlocks({ title, message, link }) {
   return blocks;
 }
 
+function chunkMrkdwnSectionsForAnnouncement(text, perBlock = 2900) {
+  const safe = String(text || '').slice(0, perBlock * 10);
+  const out = [];
+  for (let i = 0; i < safe.length; i += perBlock) {
+    out.push({ type: 'section', text: { type: 'mrkdwn', text: safe.slice(i, i + perBlock) } });
+  }
+  return out.length ? out : [{ type: 'section', text: { type: 'mrkdwn', text: ' ' } }];
+}
 function buildAnnouncementBlocks({ title, message, senderId, announcementId, groupName, linkUrl = null }) {
   return [
-    { type: 'header', text: { type: 'plain_text', text: `📣 ${title || ''}`.trim(), emoji: true } },
+    { type: 'header', text: { type: 'plain_text', text: (`📣 ${title || ''}`.trim() || '📣 Announcement').slice(0, 150), emoji: true } },
     { type: 'context', elements: [{ type: 'mrkdwn', text: `Sent by <@${senderId}>` }] },
     { type: 'divider' },
-    { type: 'section', text: { type: 'mrkdwn', text: message || '' } },
+    ...chunkMrkdwnSectionsForAnnouncement(message),
     ...(linkUrl
       ? [{ type: 'section', text: { type: 'mrkdwn', text: `🔗 <${linkUrl}|View more>` } }]
       : []),
