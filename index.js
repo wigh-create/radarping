@@ -6,6 +6,7 @@
  *   /radarping       - Alias for /announce
  *   /announce-status - Check read receipts for your announcements
  *   /radarpulse      - Send a pulse quiz / check-in
+ *   /radarping-review - View & cancel pending scheduled posts
  */
 require('dotenv').config();
 const { App } = require('@slack/bolt');
@@ -1296,6 +1297,95 @@ app.view('pulse_export_modal_submit', async ({ ack, body, view, client, logger }
   } catch (err) { logger.error('pulse_export_modal_submit error:', err); }
 });
 // ============================================================
+//  /radarping-review — view & cancel pending scheduled posts
+// ============================================================
+function formatScheduledPostBlocks(posts) {
+  if (posts.length === 0) {
+    return [{ type: 'section', text: { type: 'mrkdwn', text: '_No pending scheduled posts._\n\nUse `/radarping` or `/radarpulse` to schedule one.' } }];
+  }
+  const blocks = [
+    { type: 'section', text: { type: 'mrkdwn', text: `You have *${posts.length}* pending scheduled post${posts.length !== 1 ? 's' : ''}.` } },
+    { type: 'divider' },
+  ];
+  for (const p of posts) {
+    const payload = typeof p.payload === 'string' ? JSON.parse(p.payload) : p.payload;
+    const typeLabel = p.type === 'pulse' ? '📊 Pulse' : '📣 Announce';
+    const title = payload.title || (payload.message ? payload.message.slice(0, 80) : 'Untitled');
+    const audienceParts = [];
+    if (payload.channels?.length) audienceParts.push(`${payload.channels.length} channel${payload.channels.length !== 1 ? 's' : ''}`);
+    if (payload.usergroupIds?.length) audienceParts.push(`${payload.usergroupIds.length} group${payload.usergroupIds.length !== 1 ? 's' : ''}`);
+    if (payload.individualUsers?.length) audienceParts.push(`${payload.individualUsers.length} individual${payload.individualUsers.length !== 1 ? 's' : ''}`);
+    const audience = audienceParts.join(' + ') || 'no audience';
+    const whenMrkdwn = `<!date^${p.scheduled_at}^{date_short_pretty} at {time}|scheduled>`;
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `*${typeLabel}* — ${title}\n⏰ ${whenMrkdwn}\n👥 ${audience}` },
+      accessory: {
+        type: 'button',
+        text: { type: 'plain_text', text: 'Cancel', emoji: true },
+        style: 'danger',
+        action_id: 'review_cancel_post',
+        value: String(p.id),
+        confirm: {
+          title: { type: 'plain_text', text: 'Cancel this post?' },
+          text: { type: 'mrkdwn', text: `*${title}*\n\nThis cannot be undone — but you can re-schedule a fresh one.` },
+          confirm: { type: 'plain_text', text: 'Cancel it' },
+          deny: { type: 'plain_text', text: 'Keep it' },
+        },
+      },
+    });
+    blocks.push({ type: 'divider' });
+  }
+  return blocks;
+}
+async function buildReviewModal(senderId) {
+  const all = await db.getScheduledPostsByUser({ user_id: senderId });
+  const now = Math.floor(Date.now() / 1000);
+  const pending = all.filter(p => p.status === 'pending' && p.scheduled_at > now);
+  return {
+    type: 'modal',
+    callback_id: 'radarping_review_modal',
+    title: { type: 'plain_text', text: '📋 Scheduled Posts', emoji: true },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: formatScheduledPostBlocks(pending),
+  };
+}
+app.command('/radarping-review', async ({ ack, body, client, logger }) => {
+  await ack();
+  try {
+    const view = await buildReviewModal(body.user_id);
+    await client.views.open({ trigger_id: body.trigger_id, view });
+  } catch (err) {
+    logger.error('radarping-review error:', err);
+    await client.chat.postMessage({ channel: body.user_id, text: `❌ Could not load scheduled posts: ${err.message}` });
+  }
+});
+app.action('review_cancel_post', async ({ ack, body, action, client, logger }) => {
+  await ack();
+  try {
+    const postId = parseInt(action.value, 10);
+    const senderId = body.user.id;
+    // Verify ownership before cancelling
+    const all = await db.getScheduledPostsByUser({ user_id: senderId });
+    const target = all.find(p => p.id === postId);
+    if (!target) {
+      await client.chat.postMessage({ channel: senderId, text: `❌ That post wasn't found or isn't yours.` });
+      return;
+    }
+    if (target.status !== 'pending') {
+      await client.chat.postMessage({ channel: senderId, text: `⚠️ That post is already *${target.status}* — too late to cancel.` });
+      return;
+    }
+    await db.cancelScheduledPost({ id: postId });
+    // Refresh the modal in place
+    const updated = await buildReviewModal(senderId);
+    await client.views.update({ view_id: body.view.id, view: updated });
+    await client.chat.postMessage({ channel: senderId, text: `✅ Cancelled scheduled post.` });
+  } catch (err) {
+    logger.error('review_cancel_post error:', err);
+  }
+});
+// ============================================================
 //  buildPulseCSV — generates CSV string for a campaign
 // ============================================================
 function csvEscape(val) {
@@ -1404,5 +1494,6 @@ function buildPulseResultsBlocks(campaign, completedResponses) {
   console.log(`     /announce-status   - View read receipts`);
   console.log(`     /radarpulse         - Send a pulse quiz`);
   console.log(`     /radarpulse-results - View pulse response summaries`);
-  console.log(`     /radarpulse-export  - Export pulse responses as CSV\n`);
+  console.log(`     /radarpulse-export  - Export pulse responses as CSV`);
+  console.log(`     /radarping-review   - View & cancel pending scheduled posts\n`);
 })();
