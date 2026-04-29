@@ -1320,19 +1320,30 @@ function formatScheduledPostBlocks(posts) {
     blocks.push({
       type: 'section',
       text: { type: 'mrkdwn', text: `*${typeLabel}* — ${title}\n⏰ ${whenMrkdwn}\n👥 ${audience}` },
-      accessory: {
-        type: 'button',
-        text: { type: 'plain_text', text: 'Cancel', emoji: true },
-        style: 'danger',
-        action_id: 'review_cancel_post',
-        value: String(p.id),
-        confirm: {
-          title: { type: 'plain_text', text: 'Cancel this post?' },
-          text: { type: 'mrkdwn', text: `*${title}*\n\nThis cannot be undone — but you can re-schedule a fresh one.` },
-          confirm: { type: 'plain_text', text: 'Cancel it' },
-          deny: { type: 'plain_text', text: 'Keep it' },
+    });
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '👀 Preview', emoji: true },
+          action_id: 'review_preview_post',
+          value: String(p.id),
         },
-      },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '❌ Cancel', emoji: true },
+          style: 'danger',
+          action_id: 'review_cancel_post',
+          value: String(p.id),
+          confirm: {
+            title: { type: 'plain_text', text: 'Cancel this post?' },
+            text: { type: 'mrkdwn', text: `*${title}*\n\nThis cannot be undone — but you can re-schedule a fresh one.` },
+            confirm: { type: 'plain_text', text: 'Cancel it' },
+            deny: { type: 'plain_text', text: 'Keep it' },
+          },
+        },
+      ],
     });
     blocks.push({ type: 'divider' });
   }
@@ -1358,6 +1369,83 @@ app.command('/radarping-review', async ({ ack, body, client, logger }) => {
   } catch (err) {
     logger.error('radarping-review error:', err);
     await client.chat.postMessage({ channel: body.user_id, text: `❌ Could not load scheduled posts: ${err.message}` });
+  }
+});
+// Build an announcement preview (mirrors schedules.js buildAnnouncementBlocks but with neutered action_ids)
+function buildAnnouncePreviewBlocks({ title, message, link }) {
+  return [
+    { type: 'header', text: { type: 'plain_text', text: `📣 ${title || 'Announcement'}`.trim(), emoji: true } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: 'Sent by _<your name will appear here>_' }] },
+    { type: 'divider' },
+    { type: 'section', text: { type: 'mrkdwn', text: message || '_(no message)_' } },
+    ...(link ? [{ type: 'section', text: { type: 'mrkdwn', text: `🔗 <${link}|View more>` } }] : []),
+    { type: 'divider' },
+    {
+      type: 'actions',
+      elements: [
+        link
+          ? { type: 'button', text: { type: 'plain_text', text: '📖 Open to Read', emoji: true }, action_id: 'preview_noop_open', url: link, style: 'primary' }
+          : { type: 'button', text: { type: 'plain_text', text: '✅ Mark as Read', emoji: true }, action_id: 'preview_noop_mark', style: 'primary' },
+      ],
+    },
+  ];
+}
+// Strip action_ids from interactive elements so preview clicks don't trigger real handlers
+function neuterActionIds(blocks) {
+  return JSON.parse(JSON.stringify(blocks)).map(b => {
+    if (b.type === 'actions' && Array.isArray(b.elements)) {
+      b.elements = b.elements.map(el => ({ ...el, action_id: `preview_noop_${el.action_id}` }));
+    }
+    if (b.accessory?.action_id) {
+      b.accessory.action_id = `preview_noop_${b.accessory.action_id}`;
+    }
+    return b;
+  });
+}
+app.action(/^preview_noop_/, async ({ ack }) => { await ack(); });
+app.action('review_preview_post', async ({ ack, body, action, client, logger }) => {
+  await ack();
+  try {
+    const postId = parseInt(action.value, 10);
+    const senderId = body.user.id;
+    const all = await db.getScheduledPostsByUser({ user_id: senderId });
+    const target = all.find(p => p.id === postId);
+    if (!target) {
+      await client.chat.postMessage({ channel: senderId, text: `❌ Post not found.` });
+      return;
+    }
+    const payload = typeof target.payload === 'string' ? JSON.parse(target.payload) : target.payload;
+    const banner = {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `👀 *PREVIEW* — this is what recipients will see when *${target.type === 'pulse' ? 'pulse' : 'announcement'}* sends. Buttons here are inert.` }],
+    };
+    let previewBlocks;
+    let fallback;
+    if (target.type === 'pulse') {
+      const fakeCampaign = {
+        id: `preview-${target.id}`,
+        title: payload.title || 'Untitled Pulse',
+        questions: payload.questions || [],
+      };
+      if (fakeCampaign.questions.length === 0) {
+        await client.chat.postMessage({ channel: senderId, text: `⚠️ This pulse has no questions to preview.` });
+        return;
+      }
+      previewBlocks = neuterActionIds(buildPulseDMBlocks(fakeCampaign, 0));
+      // Append note about Q count
+      if (fakeCampaign.questions.length > 1) {
+        previewBlocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `_Recipients see one question at a time — ${fakeCampaign.questions.length} total in this pulse._` }] });
+      }
+      fallback = `Preview: ${fakeCampaign.title}`;
+    } else {
+      // announce
+      previewBlocks = buildAnnouncePreviewBlocks({ title: payload.title, message: payload.message, link: payload.link });
+      fallback = `Preview: ${payload.title || payload.message?.slice(0, 80) || 'Announcement'}`;
+    }
+    await client.chat.postMessage({ channel: senderId, text: fallback, blocks: [banner, { type: 'divider' }, ...previewBlocks] });
+  } catch (err) {
+    logger.error('review_preview_post error:', err);
+    await client.chat.postMessage({ channel: body.user.id, text: `❌ Could not build preview: ${err.message}` });
   }
 });
 app.action('review_cancel_post', async ({ ack, body, action, client, logger }) => {
