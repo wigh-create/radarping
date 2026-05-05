@@ -238,6 +238,11 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   await ack();
   const senderId = body.user.id;
   const senderName = body.user.name;
+  let senderDisplayName = senderName;
+  try {
+    const senderInfo = await client.users.info({ user: senderId });
+    senderDisplayName = senderInfo.user?.profile?.real_name || senderInfo.user?.profile?.display_name || senderName;
+  } catch {}
   const values = view.state.values;
   const title = values.title_block.title_input.value;
   const message = values.message_block.message_input.value;
@@ -358,7 +363,7 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   }
   userIds = allUserIds;
   const announcementId = randomUUID();
-  await db.createAnnouncement({ id: announcementId, sender_id: senderId, sender_name: senderName, message, group_name: groupName, target_type: targetType, target_id: targetId });
+  await db.createAnnouncement({ id: announcementId, sender_id: senderId, sender_name: senderDisplayName, message, group_name: groupName, target_type: targetType, target_id: targetId });
   const recipientUsers = [];
   for (const uid of userIds) {
     try {
@@ -374,7 +379,7 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
   await db.updateRecipientCount(announcementId, recipientUsers.length);
   const sentAt = new Date().toISOString();
   notion.createAnnouncementPage({
-    announcementId, title, message, senderName, groupName,
+    announcementId, title, message, senderName: senderDisplayName, groupName,
     totalRecipients: recipientUsers.length, linkUrl, sentAt,
   }).then(announcementPageId => {
     if (announcementPageId && recipientUsers.length > 0) {
@@ -387,7 +392,7 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       const dmResult = await client.chat.postMessage({
         channel: recipient.user_id,
         text: `📣 Announcement from <@${senderId}>: ${message}`,
-        blocks: buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl),
+        blocks: buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl, senderDisplayName),
       });
       if (dmResult?.ts) await db.storeDmTs(announcementId, recipient.user_id, dmResult.ts, dmResult.channel);
       sent++;
@@ -399,7 +404,7 @@ app.view('announce_modal_submit', async ({ ack, body, view, client, logger }) =>
       await client.chat.postMessage({
         channel: chan.id,
         text: `📣 Announcement from <@${senderId}>: ${message}`,
-        blocks: buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl),
+        blocks: buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl, senderDisplayName),
       });
     } catch (err) { logger.warn(`Could not post to channel ${chan.name}:`, err.message); }
   }
@@ -529,10 +534,10 @@ app.command('/announce-status', async ({ ack, body, client, logger }) => {
 // ============================================================
 //  Helpers
 // ============================================================
-function buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl = null) {
+function buildAnnouncementBlocks(title, message, senderId, announcementId, groupName, linkUrl = null, senderDisplayName = null) {
   return [
     { type: 'header', text: { type: 'plain_text', text: `📣 ${title}`, emoji: true } },
-    { type: 'context', elements: [{ type: 'mrkdwn', text: `Sent by <@${senderId}>` }] },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: `Sent by ${senderDisplayName ? `*${senderDisplayName}*` : `<@${senderId}>`}` }] },
     { type: 'divider' },
     { type: 'section', text: { type: 'mrkdwn', text: message } },
     { type: 'divider' },
@@ -550,25 +555,68 @@ async function sendStatusReport(client, requesterId, announcementId, logger) {
   const announcement = await db.getAnnouncement(announcementId);
   if (!announcement) { await client.chat.postMessage({ channel: requesterId, text: '❌ Announcement not found.' }); return; }
   const stats = await db.getRecipientStats(announcementId);
-  const pending = await db.getPendingReaders(announcementId);
   const all = await db.getAllReaders(announcementId);
   const pct = stats.total > 0 ? Math.round((stats.read_count / stats.total) * 100) : 0;
   const bar = buildProgressBar(pct);
   const date = new Date(announcement.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-  const readList = all.filter(r => r.read_at).map(r => `✅ <@${r.user_id}>`).join('  ');
-  const pendingList = pending.slice(0, 20).map(r => `⏳ <@${r.user_id}>`).join('  ');
+
+  // Split into read and pending lists
+  const readRecipients = all.filter(r => r.read_at);
+  const pendingRecipients = all.filter(r => !r.read_at);
+
+  // Build per-person read list with timestamps
+  const readLines = readRecipients.map(r => {
+    const readTime = new Date(r.read_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    const name = r.user_name && r.user_name !== r.user_id ? `*${r.user_name}*` : `<@${r.user_id}>`;
+    return `✅ ${name} — ${readTime}`;
+  });
+
+  // Build per-person pending list
+  const pendingLines = pendingRecipients.map(r => {
+    const name = r.user_name && r.user_name !== r.user_id ? `*${r.user_name}*` : `<@${r.user_id}>`;
+    return `⏳ ${name}`;
+  });
+
+  const announcementTitle = announcement.message.slice(0, 80) + (announcement.message.length > 80 ? '...' : '');
+  const senderLabel = announcement.sender_name ? `*${announcement.sender_name}*` : `<@${announcement.sender_id}>`;
+
   const blocks = [
-    { type: 'header', text: { type: 'plain_text', text: '📊 Read Receipt Report', emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: `*"${announcement.message.slice(0, 120)}${announcement.message.length > 120 ? '...' : ''}"*\n📅 Sent ${date} to *${announcement.group_name}*` } },
+    { type: 'header', text: { type: 'plain_text', text: `📊 Read Receipts for "${announcementTitle}"`, emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: `Sent by ${senderLabel} · 📅 ${date} · 👥 *${announcement.group_name}*` } },
     { type: 'divider' },
-    { type: 'section', text: { type: 'mrkdwn', text: `${bar}  *${stats.read_count}/${stats.total}* have read this (${pct}%)` } },
+    { type: 'section', text: { type: 'mrkdwn', text: `${bar}  *${stats.read_count}/${stats.total}* read (${pct}%)` } },
+    { type: 'divider' },
   ];
-  if (readList) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*✅ Read (${stats.read_count}):*\n${readList || '_none yet_'}` } });
-  if (pendingList) {
-    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*⏳ Not yet read (${pending.length}):*\n${pendingList}${pending.length > 20 ? `\n_...and ${pending.length - 20} more_` : ''}` } });
-    blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '👋 Nudge Unread People', emoji: true }, action_id: 'nudge_unread', value: announcementId, style: 'danger' }] });
+
+  // ✅ Read section
+  if (readRecipients.length > 0) {
+    // Slack section text has a 3000-char limit; chunk into groups of 20
+    const chunks = [];
+    for (let i = 0; i < readLines.length; i += 20) chunks.push(readLines.slice(i, i + 20));
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*✅ Read (${readRecipients.length}):*` } });
+    for (const chunk of chunks) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk.join('\n') } });
+    }
+  } else {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*✅ Read (0):*\n_No one has read it yet._` } });
   }
-  await client.chat.postMessage({ channel: requesterId, blocks, text: 'Read receipt report' });
+
+  blocks.push({ type: 'divider' });
+
+  // ⏳ Pending section
+  if (pendingRecipients.length > 0) {
+    const chunks = [];
+    for (let i = 0; i < pendingLines.length; i += 20) chunks.push(pendingLines.slice(i, i + 20));
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*⏳ Pending (${pendingRecipients.length}):*` } });
+    for (const chunk of chunks) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk.join('\n') } });
+    }
+    blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '👋 Nudge Unread People', emoji: true }, action_id: 'nudge_unread', value: announcementId, style: 'danger' }] });
+  } else {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*⏳ Pending (0):*\n_Everyone has read it! 🎉_` } });
+  }
+
+  await client.chat.postMessage({ channel: requesterId, blocks, text: `📊 Read Receipts: ${stats.read_count}/${stats.total} read (${pct}%)` });
 }
 // ============================================================
 //  Nudge unread recipients
