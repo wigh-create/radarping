@@ -492,43 +492,75 @@ app.action('check_status', async ({ ack, body, action, client, logger }) => {
   await sendStatusReport(client, body.user.id, action.value, logger);
 });
 // ============================================================
-//  /announce-status - View read receipt dashboard
+//  /announce-status - Open modal to pick an announcement
 // ============================================================
+async function buildAnnouncePickerOptions(senderId) {
+  const announcements = await db.getRecentAnnouncements(senderId, 20);
+  const options = [];
+  for (const ann of announcements) {
+    const stats = await db.getRecipientStats(ann.id);
+    const pct = stats.total > 0 ? Math.round((stats.read_count / stats.total) * 100) : 0;
+    const date = new Date(ann.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    const title = ann.message.slice(0, 80) + (ann.message.length > 80 ? '...' : '');
+    const label = `${title} - ${stats.read_count}/${stats.total} read (${pct}%) · ${date}`;
+    options.push({
+      text: { type: 'plain_text', text: label.slice(0, 75), emoji: true },
+      value: ann.id,
+    });
+  }
+  return options;
+}
 app.command('/announce-status', async ({ ack, body, client, logger }) => {
   await ack();
   const senderId = body.user.id;
-  const args = (body.text || '').trim();
-  if (args) {
-    const recent = await db.getRecentAnnouncements(senderId, 20);
-    const match = recent.find(a => a.id.startsWith(args) || a.id === args);
-    if (match) {
-      await sendStatusReport(client, senderId, match.id, logger);
-    } else {
-      await client.chat.postMessage({ channel: senderId, text: `❌ No announcement found matching \`${args}\`. Try \`/announce-status\` (no args) to see your recent announcements.` });
-    }
-  } else {
-    const recent = await db.getRecentAnnouncements(senderId, 10);
-    if (recent.length === 0) {
-      await client.chat.postMessage({ channel: senderId, text: '📭 You haven\'t sent any announcements yet. Use `/announce` to send one!' });
-      return;
-    }
-    const blocks = [
-      { type: 'header', text: { type: 'plain_text', text: '📣 Your Recent Announcements', emoji: true } },
-      { type: 'divider' },
-    ];
-    for (const ann of recent) {
-      const stats = await db.getRecipientStats(ann.id);
-      const pct = stats.total > 0 ? Math.round((stats.read_count / stats.total) * 100) : 0;
-      const bar = buildProgressBar(pct);
-      const date = new Date(ann.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
-      blocks.push({
-        type: 'section',
-        text: { type: 'mrkdwn', text: `*"${ann.message.slice(0, 80)}${ann.message.length > 80 ? '...' : ''}"*\n👥 *${ann.group_name}* · 📅 ${date}\n${bar} *${stats.read_count}/${stats.total}* read (${pct}%)` },
-        accessory: { type: 'button', text: { type: 'plain_text', text: '📊 Details', emoji: true }, action_id: 'check_status', value: ann.id },
-      });
-      blocks.push({ type: 'divider' });
-    }
-    await client.chat.postMessage({ channel: senderId, blocks, text: 'Your recent announcements' });
+  let options;
+  try {
+    options = await buildAnnouncePickerOptions(senderId);
+  } catch (err) {
+    logger.error('Error building announce picker options:', err);
+    options = [];
+  }
+  if (options.length === 0) {
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: 'modal',
+        title: { type: 'plain_text', text: 'No Announcements Found' },
+        close: { type: 'plain_text', text: 'Close' },
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: "You haven't sent any announcements yet. Use `/announce` to send your first one." } }],
+      },
+    });
+    return;
+  }
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal',
+      callback_id: 'announce_status_modal_submit',
+      title: { type: 'plain_text', text: '📊 Announcement Status', emoji: true },
+      submit: { type: 'plain_text', text: 'View Details', emoji: true },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [{
+        type: 'input',
+        block_id: 'announce_select_block',
+        label: { type: 'plain_text', text: 'Select an announcement', emoji: true },
+        element: { type: 'static_select', action_id: 'announce_select', placeholder: { type: 'plain_text', text: 'Choose one...' }, options },
+      }],
+    },
+  });
+});
+// ============================================================
+//  announce_status_modal_submit - Show read receipt details
+// ============================================================
+app.view('announce_status_modal_submit', async ({ ack, body, view, client, logger }) => {
+  await ack();
+  const userId = body.user.id;
+  const announcementId = view.state.values.announce_select_block.announce_select.selected_option?.value;
+  if (!announcementId) return;
+  try {
+    await sendStatusReport(client, userId, announcementId, logger);
+  } catch (err) {
+    logger.error('announce_status_modal_submit error:', err);
   }
 });
 // ============================================================
