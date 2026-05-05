@@ -494,19 +494,30 @@ app.action('check_status', async ({ ack, body, action, client, logger }) => {
 // ============================================================
 //  /announce-status - Open modal to pick an announcement
 // ============================================================
-async function buildAnnouncePickerOptions(senderId) {
-  const announcements = await db.getRecentAnnouncements(senderId, 20);
+async function buildAnnouncePickerOptions(senderId, logger) {
+  const raw = await db.getRecentAnnouncements(senderId, 20);
+  const announcements = Array.isArray(raw) ? raw : [];
+  if (logger) logger.info(`buildAnnouncePickerOptions: got ${announcements.length} announcements for sender ${senderId}`);
   const options = [];
   for (const ann of announcements) {
-    const stats = await db.getRecipientStats(ann.id);
-    const pct = stats.total > 0 ? Math.round((stats.read_count / stats.total) * 100) : 0;
-    const date = new Date(ann.created_at * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
-    const title = ann.message.slice(0, 80) + (ann.message.length > 80 ? '...' : '');
-    const label = `${title} - ${stats.read_count}/${stats.total} read (${pct}%) · ${date}`;
-    options.push({
-      text: { type: 'plain_text', text: label.slice(0, 75), emoji: true },
-      value: ann.id,
-    });
+    try {
+      if (!ann || !ann.id) {
+        if (logger) logger.warn('buildAnnouncePickerOptions: skipping announcement with missing id', ann);
+        continue;
+      }
+      const stats = await db.getRecipientStats(ann.id);
+      const pct = stats.total > 0 ? Math.round((stats.read_count / stats.total) * 100) : 0;
+      const date = new Date((ann.created_at || 0) * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+      const message = ann.message || '';
+      const title = message.slice(0, 80) + (message.length > 80 ? '...' : '');
+      const label = `${title} - ${stats.read_count}/${stats.total} read (${pct}%) · ${date}`;
+      options.push({
+        text: { type: 'plain_text', text: label.slice(0, 75), emoji: true },
+        value: ann.id,
+      });
+    } catch (annErr) {
+      if (logger) logger.warn('buildAnnouncePickerOptions: skipping announcement due to error', annErr);
+    }
   }
   return options;
 }
@@ -515,7 +526,7 @@ app.command('/announce-status', async ({ ack, body, client, logger }) => {
   const senderId = body.user.id;
   let options;
   try {
-    options = await buildAnnouncePickerOptions(senderId);
+    options = await buildAnnouncePickerOptions(senderId, logger);
   } catch (err) {
     logger.error('Error building announce picker options:', err);
     options = [];
